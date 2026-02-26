@@ -54,7 +54,7 @@ LiteRtDispatchInvocationContextT::Create(
     return litert::Error(kLiteRtStatusErrorRuntimeFailure,
                          "Failed to get OpenVINO core from device context");
   }
-  ov::CompiledModel compiled_model = core->import_model(model_stream, "NPU");
+  ov::CompiledModel compiled_model = core->import_model(model_stream, "GPU");
   auto infer_request = compiled_model.create_infer_request();
   LITERT_LOG(LITERT_INFO, "Openvino InvocationContext Initialize SUCCESS");
   // TODO: add support for loading cached model
@@ -69,8 +69,7 @@ LiteRtDispatchInvocationContextT::GetTensorBufferRequirements(
 #if defined(LITERT_WINDOWS_OS)
       kLiteRtTensorBufferTypeOpenVINOTensorBuffer,
 #else
-      // OpenVINO RemoteTensor doesn't support copy-free AHWB buffer. Until
-      // it's supported, we use DMA-BUF.
+      kLiteRtTensorBufferTypeHostMemory,
       kLiteRtTensorBufferTypeDmaBuf,
       kLiteRtTensorBufferTypeAhwb,
 #endif
