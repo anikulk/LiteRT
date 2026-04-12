@@ -29,16 +29,13 @@
 #include "litert/vendors/intel_openvino/dispatch/device_context.h"
 #include "litert/vendors/intel_openvino/dispatch/invocation_context.h"
 
-#if defined(LITERT_WINDOWS_OS)
 #include "litert/c/internal/litert_tensor_buffer_registry.h"
 #include "litert/c/litert_custom_tensor_buffer.h"
 #include "litert/vendors/intel_openvino/dispatch/openvino_tensor_buffer.h"
-#endif  // LITERT_WINDOWS_OS
 
 namespace litert {
 namespace openvino {
 
-#if defined(LITERT_WINDOWS_OS)
 LiteRtStatus CreateOpenVinoTensorBuffer(
     LiteRtGpuDeviceId device_id, LiteRtGpuQueueId queue_id,
     const LiteRtRankedTensorType* tensor_type,
@@ -86,7 +83,6 @@ LiteRtStatus LockOpenVinoTensorBuffer(HwMemoryInfoPtr hw_memory_info,
   *host_memory_ptr = result.Value();
   return kLiteRtStatusOk;
 }
-#endif  // LITERT_WINDOWS_OS
 
 // Initialize the Dispatch API runtime.
 // This function should be called before calling any other Dispatch API
@@ -105,14 +101,12 @@ LiteRtStatus DispatchInitialize(const LiteRtRuntimeContext* runtime_context,
     LITERT_LOG(LITERT_INFO, "[Openvino]Found device plugin for: %s",
                device.c_str());
 
-#if defined(LITERT_WINDOWS_OS)
   LITERT_RETURN_IF_ERROR(LiteRtRegisterTensorBufferHandlers(
       env, kLiteRtTensorBufferTypeOpenVINOTensorBuffer,
       CreateOpenVinoTensorBuffer, DestroyOpenVinoTensorBuffer,
       LockOpenVinoTensorBuffer, UnlockOpenVinoTensorBuffer, nullptr, nullptr,
       /*device_tag=*/kLiteRtEnvOptionTagNull,
       /*queue_tag=*/kLiteRtEnvOptionTagNull));
-#endif  // LITERT_WINDOWS_OS
 
   return kLiteRtStatusOk;
 }
