@@ -28,8 +28,11 @@
 #include "openvino/core/rt_info.hpp"
 #include "openvino/frontend/tensorflow_lite/frontend.hpp"
 #include "openvino/frontend/tensorflow_lite/graph_iterator.hpp"
+#include "openvino/op/add.hpp"
+#include "openvino/op/concat.hpp"
 #include "openvino/op/fake_quantize.hpp"
 #include "openvino/op/matmul.hpp"
+#include "openvino/op/slice.hpp"
 #include "openvino/openvino.hpp"
 #include "openvino/pass/graph_rewrite.hpp"
 #include "openvino/pass/manager.hpp"
@@ -165,6 +168,204 @@ class EliminateMatMulFakeQuantize : public ov::pass::MatcherPass {
 
     auto m = std::make_shared<pattern::Matcher>(fq_pattern,
                                                 "EliminateMatMulFakeQuantize");
+    register_matcher(m, callback);
+  }
+};
+
+// Helper functions for attention matmul merging
+namespace {
+
+bool SoleConsumerIs(const ov::Output<ov::Node>& output,
+                    const ov::Node* candidate_node) {
+  auto targets = output.get_target_inputs();
+  if (targets.empty()) return false;
+  for (const auto& target : targets) {
+    if (target.get_node() != candidate_node) return false;
+  }
+  return true;
+}
+
+bool MatMulAttrsOk(const std::shared_ptr<ov::Node>& node) {
+  if (auto matmul = std::dynamic_pointer_cast<ov::op::v0::MatMul>(node)) {
+    return matmul->get_transpose_b() && !matmul->get_transpose_a();
+  }
+  return false;
+}
+
+ov::Output<ov::Node> GetSliceSource(const ov::Output<ov::Node>& output) {
+  if (auto slice = std::dynamic_pointer_cast<ov::op::v8::Slice>(
+          output.get_node_shared_ptr())) {
+    return slice->input_value(0);
+  }
+  return {};
+}
+
+bool SameOutput(const ov::Output<ov::Node>& a, const ov::Output<ov::Node>& b) {
+  return a.get_node() == b.get_node() && a.get_index() == b.get_index();
+}
+
+}  // namespace
+
+// Pass 1: Merge QK score matmuls
+// Matches: Concat(MatMul(Q, K_cache, trans_b=T), MatMul(Q, K_cur, trans_b=T), axis=last)
+// Replaces: MatMul(Q, Concat(K_cache, K_cur, axis=seq_dim_of_K), trans_b=T)
+class MergeQKMatMuls : public ov::pass::MatcherPass {
+ public:
+  OPENVINO_MATCHER_PASS_RTTI("MergeQKMatMuls");
+  MergeQKMatMuls() {
+    namespace pattern = ov::pass::pattern;
+
+    auto matmul_cache_pattern = pattern::wrap_type<ov::op::v0::MatMul>(
+        {pattern::any_input(), pattern::any_input()});
+    auto matmul_cur_pattern = pattern::wrap_type<ov::op::v0::MatMul>(
+        {pattern::any_input(), pattern::any_input()});
+    auto concat_pattern = pattern::wrap_type<ov::op::v0::Concat>(
+        {matmul_cache_pattern, matmul_cur_pattern});
+
+    ov::matcher_pass_callback callback = [=](pattern::Matcher& m) {
+      auto pattern_map = m.get_pattern_value_map();
+      auto concat = std::dynamic_pointer_cast<ov::op::v0::Concat>(
+          pattern_map[concat_pattern].get_node_shared_ptr());
+      if (!concat || concat->get_input_size() != 2) return false;
+
+      auto mm0 = concat->input_value(0).get_node_shared_ptr();
+      auto mm1 = concat->input_value(1).get_node_shared_ptr();
+
+      if (!MatMulAttrsOk(mm0) || !MatMulAttrsOk(mm1)) return false;
+
+      // Both MatMuls must share the same Q (input port 0)
+      auto q0 = mm0->input_value(0);
+      auto q1 = mm1->input_value(0);
+      if (!SameOutput(q0, q1)) return false;
+
+      // The Concat axis must be the last dim (scores sequence axis)
+      int64_t axis = concat->get_axis();
+      auto score_shape = concat->get_output_partial_shape(0);
+      if (score_shape.rank().is_static()) {
+        int64_t rank = score_shape.rank().get_length();
+        if (axis != rank - 1 && axis != -1) return false;
+      }
+
+      // Safety: each MatMul output consumed only by this Concat
+      if (!SoleConsumerIs(mm0->output(0), concat.get())) return false;
+      if (!SoleConsumerIs(mm1->output(0), concat.get())) return false;
+
+      auto k_cache = mm0->input_value(1);
+      auto k_cur = mm1->input_value(1);
+
+      // K has shape [..., seq, head_dim], seq is second-to-last axis
+      auto k_shape = k_cache.get_partial_shape();
+      int64_t k_seq_axis = k_shape.rank().is_static()
+          ? k_shape.rank().get_length() - 2 : 2;
+
+      auto k_full = std::make_shared<ov::op::v0::Concat>(
+          ov::OutputVector{k_cache, k_cur}, k_seq_axis);
+      auto new_mm = std::make_shared<ov::op::v0::MatMul>(
+          q0, k_full, false, true);
+
+      k_full->set_friendly_name(mm0->get_friendly_name() + "/k_full_concat");
+      new_mm->set_friendly_name(mm0->get_friendly_name() + "/qk_merged");
+
+      ov::copy_runtime_info({mm0, mm1, concat}, {k_full, new_mm});
+      ov::replace_node(concat, new_mm);
+      return true;
+    };
+
+    auto m = std::make_shared<pattern::Matcher>(concat_pattern, "MergeQKMatMuls");
+    register_matcher(m, callback);
+  }
+};
+
+// Pass 2: Merge AV context matmuls
+// Matches: Add(MatMul(A_cache, V_cache, trans_b=T), MatMul(A_cur, V_cur, trans_b=T))
+// Replaces: MatMul(A_full, V_full, trans_b=T) where A_full and V_full are concatenated
+class MergeAVMatMuls : public ov::pass::MatcherPass {
+ public:
+  OPENVINO_MATCHER_PASS_RTTI("MergeAVMatMuls");
+  MergeAVMatMuls() {
+    namespace pattern = ov::pass::pattern;
+
+    auto matmul_cache_pattern = pattern::wrap_type<ov::op::v0::MatMul>(
+        {pattern::any_input(), pattern::any_input()});
+    auto matmul_cur_pattern = pattern::wrap_type<ov::op::v0::MatMul>(
+        {pattern::any_input(), pattern::any_input()});
+    auto add_pattern = pattern::wrap_type<ov::op::v1::Add>(
+        {matmul_cache_pattern, matmul_cur_pattern});
+
+    ov::matcher_pass_callback callback = [=](pattern::Matcher& m) {
+      auto pattern_map = m.get_pattern_value_map();
+      auto add = std::dynamic_pointer_cast<ov::op::v1::Add>(
+          pattern_map[add_pattern].get_node_shared_ptr());
+      if (!add || add->get_input_size() != 2) return false;
+
+      auto mm0 = add->input_value(0).get_node_shared_ptr();
+      auto mm1 = add->input_value(1).get_node_shared_ptr();
+
+      if (!MatMulAttrsOk(mm0) || !MatMulAttrsOk(mm1)) return false;
+
+      // Safety: each MatMul output consumed only by this Add
+      if (!SoleConsumerIs(mm0->output(0), add.get())) return false;
+      if (!SoleConsumerIs(mm1->output(0), add.get())) return false;
+
+      auto a_cache = mm0->input_value(0);
+      auto v_cache = mm0->input_value(1);
+      auto a_cur = mm1->input_value(0);
+      auto v_cur = mm1->input_value(1);
+
+      // Check output shape compatibility
+      auto out_shape0 = mm0->get_output_partial_shape(0);
+      auto out_shape1 = mm1->get_output_partial_shape(0);
+      if (out_shape0.rank().is_static() && out_shape1.rank().is_static()) {
+        if (out_shape0.rank().get_length() != out_shape1.rank().get_length()) {
+          return false;
+        }
+      }
+
+      // Build A_input - optimize if both are slices of same source
+      ov::Output<ov::Node> a_input;
+      std::shared_ptr<ov::Node> a_concat_node;
+      auto a_cache_src = GetSliceSource(a_cache);
+      auto a_cur_src = GetSliceSource(a_cur);
+
+      if (a_cache_src.get_node() && a_cur_src.get_node() &&
+          SameOutput(a_cache_src, a_cur_src)) {
+        // Both slices from same source - use source directly
+        a_input = a_cache_src;
+      } else {
+        // General case - concatenate
+        auto a_shape = a_cache.get_partial_shape();
+        int64_t a_seq_axis = a_shape.rank().is_static()
+            ? a_shape.rank().get_length() - 1 : 3;
+        a_concat_node = std::make_shared<ov::op::v0::Concat>(
+            ov::OutputVector{a_cache, a_cur}, a_seq_axis);
+        a_concat_node->set_friendly_name(mm0->get_friendly_name() + "/a_full_concat");
+        a_input = a_concat_node->output(0);
+      }
+
+      // Build V_full
+      auto v_shape = v_cache.get_partial_shape();
+      int64_t v_seq_axis = v_shape.rank().is_static()
+          ? v_shape.rank().get_length() - 1 : 3;
+      auto v_full = std::make_shared<ov::op::v0::Concat>(
+          ov::OutputVector{v_cache, v_cur}, v_seq_axis);
+      v_full->set_friendly_name(mm0->get_friendly_name() + "/v_full_concat");
+
+      // Create fused MatMul
+      auto new_mm = std::make_shared<ov::op::v0::MatMul>(
+          a_input, v_full, false, true);
+      new_mm->set_friendly_name(mm0->get_friendly_name() + "/av_merged");
+
+      ov::NodeVector nodes_to_copy = {mm0, mm1, add};
+      ov::NodeVector new_nodes = {v_full, new_mm};
+      if (a_concat_node) {
+        new_nodes.insert(new_nodes.begin(), a_concat_node);
+      }
+      ov::copy_runtime_info(nodes_to_copy, new_nodes);
+      ov::replace_node(add, new_mm);
+      return true;
+    };
+
+    auto m = std::make_shared<pattern::Matcher>(add_pattern, "MergeAVMatMuls");
     register_matcher(m, callback);
   }
 };
@@ -410,6 +611,7 @@ LiteRtStatus LiteRtCompilerPluginCompile(
     std::string device = "NPU";  // Default device
     ov::AnyMap configs_map;
     bool eliminate_fq = false;
+    bool merge_attn_matmuls = false;
 
     if (compiler_plugin->GetIntelOpenVinoOptions().HasValue()) {
       const auto& intel_opts =
@@ -447,6 +649,13 @@ LiteRtStatus LiteRtCompilerPluginCompile(
                        "Custom config: optimize_fq_after_matmul = %s",
                        value.c_str());
             eliminate_fq = (value == "true");
+            continue;  // This is a special case handled separately, so skip adding to configs_map
+          }
+          if (key == "merge_attn_matmuls") {
+            LITERT_LOG(LITERT_INFO,
+                       "Custom config: merge_attn_matmuls = %s",
+                       value.c_str());
+            merge_attn_matmuls = (value == "true");
             continue;  // This is a special case handled separately, so skip adding to configs_map
           }
           configs_map[key] = value;
@@ -520,10 +729,17 @@ LiteRtStatus LiteRtCompilerPluginCompile(
         LITERT_LOG(LITERT_INFO, "Model loaded");
         auto ov_model = tflite_fe->convert(input_model);
 
-        if (eliminate_fq) {
-          // Eliminate FakeQuantize nodes after MatMul operations.
+        if (eliminate_fq || merge_attn_matmuls) {
           ov::pass::Manager pass_manager;
-          pass_manager.register_pass<EliminateMatMulFakeQuantize>();
+          if (eliminate_fq) {
+            // Eliminate FakeQuantize nodes after MatMul operations.
+            pass_manager.register_pass<EliminateMatMulFakeQuantize>();
+          }
+          if (merge_attn_matmuls) {
+            // Merge split attention MatMuls for Gemma4 decode optimization.
+            pass_manager.register_pass<MergeQKMatMuls>();
+            pass_manager.register_pass<MergeAVMatMuls>();
+          }
           pass_manager.run_passes(ov_model);
         }
 
