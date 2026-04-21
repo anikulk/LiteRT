@@ -49,6 +49,7 @@ LiteRtStatus GetSocModelConfig(absl::string_view codename,
   auto it = GetSocModelConfigs().find(std::string(codename));
   if (it != GetSocModelConfigs().end()) {
     config_map["NPU_PLATFORM"] = it->second;
+    LITERT_LOG(LITERT_INFO, "Recognized SoC model: %s", codename.data());
     return kLiteRtStatusOk;
   }
   LITERT_LOG(LITERT_ERROR, "Unrecognized SoC model: %s", codename.data());

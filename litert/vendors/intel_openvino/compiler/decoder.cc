@@ -769,6 +769,15 @@ litert::Expected<ov::Any> DecoderOperation::fetch_attribute(
         return ov::Any(keep_dims);
       }
       break;
+    case LiteRtOpCode::kLiteRtOpCodeTflReduceAll:
+      if (name == "keep_dims") {
+        bool keep_dims;
+        LITERT_RETURN_IF_ERROR(
+            LiteRtGetReduceAllKeepDimsOption(litert_op_, &keep_dims),
+            ERROR_LOG_STR("keep_dims", op_name_.c_str()));
+        return ov::Any(keep_dims);
+      }
+      break;
     case LiteRtOpCode::kLiteRtOpCodeTflConv3d:
       if (name == "strides") {
         int32_t stride_d;

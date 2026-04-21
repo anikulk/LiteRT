@@ -82,6 +82,7 @@ constexpr LiteRtOpCode kSupportedOps[] = {
     kLiteRtOpCodeTflGatherNd,
     kLiteRtOpCodeTflSum,
     kLiteRtOpCodeTflReduceMax,
+    kLiteRtOpCodeTflReduceAll,
     kLiteRtOpCodeTflEmbeddingLookup,
     kLiteRtOpCodeTflConv3d,
     kLiteRtOpCodeTflArgMax,
@@ -110,6 +111,7 @@ constexpr LiteRtOpCode kSupportedOps[] = {
     kLiteRtOpCodeTflSin,
     kLiteRtOpCodeTflPow,
     kLiteRtOpCodeTflFloorDiv,
+    kLiteRtOpCodeTflFloorMod,
     kLiteRtOpCodeTflCos,
     kLiteRtOpCodeTflMinimum,
     kLiteRtOpCodeTflSquaredDifference,
@@ -452,21 +454,35 @@ LiteRtStatus LiteRtCompilerPluginCompile(
     result->graph_names.resize(num_partitions);
     auto tflite_fe =
         std::make_shared<ov::frontend::tensorflow_lite::FrontEnd>();
+    LITERT_LOG(LITERT_INFO, "TensorFlow Lite FrontEnd initialized");
 
     ov::Core core;
+    LITERT_LOG(LITERT_INFO, "OpenVINO Core initialized with device: %s",
+               device.c_str());
     for (int partition_idx = 0; partition_idx < num_partitions;
          ++partition_idx) {
       auto graph_name = absl::StrFormat("Partition_%d", partition_idx);
       litert::Expected<litert::Subgraph> expected_subgraph =
           model.Subgraph(partition_idx);
       if (expected_subgraph.HasValue()) {
+        LITERT_LOG(LITERT_INFO, "Compiling %s with %zu ops",
+                   graph_name.c_str(),
+                   expected_subgraph.Value().Ops().size());
         std::shared_ptr<ov::frontend::tensorflow_lite::GraphIterator>
             graph_delegate =
                 std::make_shared<litert::openvino::GraphIteratorDelegate>(
                     &expected_subgraph.Value());
+        LITERT_LOG(LITERT_INFO, "Graph delegate created");
         auto input_model = tflite_fe->load(graph_delegate);
         LITERT_LOG(LITERT_INFO, "Model loaded");
         auto ov_model = tflite_fe->convert(input_model);
+
+        // Note: CommonOptimizations (including EliminateDuplicateFakeQuantize)
+        // should be applied here before compilation, but the transformation headers
+        // are not installed in the OpenVINO runtime package. The NPU plugin does
+        // not apply these optimizations by default. To enable FakeQuantize
+        // elimination, the NPU plugin would need to be modified or a preprocessing
+        // step added.
 
         // Use device and configs_map from Intel OpenVINO options
         auto compiled_model = core.compile_model(ov_model, device, configs_map);
