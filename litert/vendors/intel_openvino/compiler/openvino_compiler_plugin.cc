@@ -646,20 +646,20 @@ LiteRtStatus LiteRtCompilerPluginCompile(
         if (!key.empty()) {  // Valid config option
           if (key == "optimize_fq_after_matmul") {
             LITERT_LOG(LITERT_INFO,
-                       "Custom config: optimize_fq_after_matmul = %s",
+                       "Debug 1 Custom config: optimize_fq_after_matmul = %s",
                        value.c_str());
             eliminate_fq = (value == "true");
             continue;  // This is a special case handled separately, so skip adding to configs_map
           }
           if (key == "merge_attn_matmuls") {
             LITERT_LOG(LITERT_INFO,
-                       "Custom config: merge_attn_matmuls = %s",
+                       "Debug 2 Custom config: merge_attn_matmuls = %s",
                        value.c_str());
             merge_attn_matmuls = (value == "true");
             continue;  // This is a special case handled separately, so skip adding to configs_map
           }
           configs_map[key] = value;
-          LITERT_LOG(LITERT_INFO, "Custom config: %s = %s", key.c_str(),
+          LITERT_LOG(LITERT_INFO, "Debug3 Custom config: %s = %s", key.c_str(),
                      value.c_str());
         }
       }
