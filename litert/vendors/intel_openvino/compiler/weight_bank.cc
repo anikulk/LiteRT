@@ -14,7 +14,10 @@
 
 #include "litert/vendors/intel_openvino/compiler/weight_bank.h"
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <vector>
 
 #include "litert/compiler/cc/litert_model.h"
 
@@ -41,6 +44,29 @@ size_t WeightBank::TotalBytes() const {
     total += size;
   }
   return total;
+}
+
+void WeightBank::Finalize() {
+  // Lay buffers out in ascending BufferId order for a deterministic packing.
+  std::vector<int32_t> buffer_ids;
+  buffer_ids.reserve(buffer_sizes_.size());
+  for (const auto& [buffer_id, size] : buffer_sizes_) {
+    buffer_ids.push_back(buffer_id);
+  }
+  std::sort(buffer_ids.begin(), buffer_ids.end());
+
+  buffer_offsets_.clear();
+  size_t offset = 0;
+  for (int32_t buffer_id : buffer_ids) {
+    buffer_offsets_[buffer_id] = offset;
+    offset += buffer_sizes_[buffer_id];
+  }
+  bank_size_ = offset;
+}
+
+size_t WeightBank::OffsetOf(int32_t buffer_id) const {
+  auto it = buffer_offsets_.find(buffer_id);
+  return it == buffer_offsets_.end() ? 0 : it->second;
 }
 
 }  // namespace litert::openvino
