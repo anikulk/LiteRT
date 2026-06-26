@@ -203,6 +203,8 @@ litert_dynamic_lib(
     deps = [
         ":graph_iterator",
         ":openvino_compile_context",
+        ":weight_bank",
+        ":weightless_tagging",
         ":openvino_soc_config",
         "//litert/c:litert_builder_header",
         "//litert/c:litert_common",

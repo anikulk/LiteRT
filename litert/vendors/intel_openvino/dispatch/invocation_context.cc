@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <chrono>  // NOLINT
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <ios>
@@ -28,6 +29,7 @@
 
 #include "openvino/core/any.hpp"
 #include "openvino/runtime/compiled_model.hpp"
+#include "openvino/runtime/properties.hpp"
 #include "openvino/runtime/tensor.hpp"
 #include "litert/c/internal/litert_logging.h"
 #include "litert/c/internal/litert_runtime_context.h"
@@ -214,7 +216,23 @@ LiteRtDispatchInvocationContextT::Create(
   }
   ov::CompiledModel compiled_model;
   try {
-    compiled_model = core->import_model(model_stream, device);
+    // Shared-weights builds export weightless blobs that reference a shared
+    // bank; import them with weights_path pointing at that bank (the same file
+    // the compiler wrote via LITERT_OV_WEIGHTS_BANK), so the weights are loaded
+    // once and shared across partitions.
+    const char* weights_bank_path = std::getenv("LITERT_OV_WEIGHTS_BANK");
+    if (weights_bank_path != nullptr && weights_bank_path[0] != '\0') {
+      LITERT_LOG(LITERT_INFO,
+                 "Importing weightless model with weights bank '%s'",
+                 weights_bank_path);
+      compiled_model = core->import_model(
+          model_stream, device,
+          {ov::cache_mode(ov::CacheMode::OPTIMIZE_SIZE),
+           ov::enable_weightless(true),
+           ov::weights_path(std::string(weights_bank_path))});
+    } else {
+      compiled_model = core->import_model(model_stream, device);
+    }
   } catch (const std::exception& e) {
     return litert::Error(kLiteRtStatusErrorRuntimeFailure, e.what());
   }

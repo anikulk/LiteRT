@@ -13,7 +13,9 @@
 // limitations under the License.
 
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <ios>
 #include <limits>
 #include <memory>
@@ -51,6 +53,8 @@
 #include "litert/vendors/intel_openvino/compiler/graph_iterator.h"
 #include "litert/vendors/intel_openvino/compiler/openvino_compile_context.h"
 #include "litert/vendors/intel_openvino/compiler/openvino_soc_config.h"
+#include "litert/vendors/intel_openvino/compiler/weight_bank.h"
+#include "litert/vendors/intel_openvino/compiler/weightless_tagging.h"
 
 namespace {
 
@@ -500,6 +504,36 @@ LiteRtStatus LiteRtCompilerPluginCompile(
     auto tflite_fe =
         std::make_shared<ov::frontend::tensorflow_lite::FrontEnd>();
 
+    // Cross-partition weight sharing (opt-in). When enabled, all partitions'
+    // distinct constant weights are packed once into a shared bank written to
+    // LITERT_OV_WEIGHTS_BANK (a path); each partition is then compiled
+    // weightless, tagging its constants with offsets into that bank. The
+    // dispatcher imports each partition with weights_path pointing at the same
+    // bank, so the weights live once at runtime.
+    litert::openvino::WeightBank weight_bank;
+    const char* weights_bank_path = std::getenv("LITERT_OV_WEIGHTS_BANK");
+    const bool share_weights = weights_bank_path != nullptr &&
+                               weights_bank_path[0] != '\0';
+    if (share_weights) {
+      for (int p = 0; p < num_partitions; ++p) {
+        auto sg = model.Subgraph(p);
+        if (sg.HasValue()) weight_bank.AddSubgraph(sg.Value());
+      }
+      weight_bank.Finalize();
+      const std::string bank = weight_bank.SerializeBank();
+      std::ofstream bank_out(weights_bank_path, std::ios::binary);
+      if (!bank_out) {
+        LITERT_LOG(LITERT_ERROR, "Weight sharing: cannot open bank file '%s'",
+                   weights_bank_path);
+        return kLiteRtStatusErrorCompilation;
+      }
+      bank_out.write(bank.data(), bank.size());
+      LITERT_LOG(LITERT_INFO,
+                 "Weight sharing: %zu buffers, bank %zu bytes -> %s",
+                 weight_bank.NumBuffers(), weight_bank.BankSize(),
+                 weights_bank_path);
+    }
+
     ov::Core core;
     for (int partition_idx = 0; partition_idx < num_partitions;
          ++partition_idx) {
@@ -526,11 +560,25 @@ LiteRtStatus LiteRtCompilerPluginCompile(
         // Run NPU-specific optimization passes.
         context.OptimizeModel(ov_model);
 
+        // For shared-weights builds, tag this partition's weight constants with
+        // their offset in the shared bank and compile weightless so the bytes
+        // are referenced (not baked) from the bank file at runtime.
+        ov::AnyMap configs = context.ConfigsMap();
+        if (share_weights) {
+          const size_t tagged =
+              litert::openvino::TagWeightlessConstants(ov_model, weight_bank);
+          configs[ov::cache_mode.name()] = ov::CacheMode::OPTIMIZE_SIZE;
+          configs[ov::enable_weightless.name()] = true;
+          LITERT_LOG(LITERT_INFO,
+                     "Weight sharing: tagged %zu constants in partition %d",
+                     tagged, partition_idx);
+        }
+
         // Compile using the per-partition device and properties.
         LITERT_LOG(LITERT_INFO, "Compiling partition %d for device %s",
                    partition_idx, context.Device().c_str());
-        auto compiled_model = core.compile_model(ov_model, context.Device(),
-                                                 context.ConfigsMap());
+        auto compiled_model =
+            core.compile_model(ov_model, context.Device(), configs);
 
         CustomOStreamBuf obuf;
         std::ostream oss(&obuf);
