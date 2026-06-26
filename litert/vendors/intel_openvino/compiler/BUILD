@@ -114,6 +114,49 @@ litert_test(
 )
 
 litert_lib(
+    name = "weightless_tagging",
+    srcs = ["weightless_tagging.cc"],
+    hdrs = ["weightless_tagging.h"],
+    copts = ["-fexceptions"],
+    features = ["-use_header_modules"],  # Incompatible with -fexceptions.
+    deps = [
+        ":weight_bank",
+        ":weightless_caching_attributes",
+        "@intel_openvino//:openvino",
+    ],
+)
+
+litert_test(
+    name = "weightless_tagging_test",
+    srcs = ["weightless_tagging_test.cc"],
+    copts = ["-fexceptions"],
+    data = [
+        "//litert/test:mlir_test_data",
+        "//litert/test:tflite_test_data",
+    ],
+    features = ["-use_header_modules"],  # Incompatible with -fexceptions.
+    tags = [
+        "manual",
+        "nobuilder",
+        "notap",
+    ],
+    deps = [
+        ":graph_iterator",
+        ":weight_bank",
+        ":weightless_caching_attributes",
+        ":weightless_tagging",
+        "//litert/c:litert_runtime_c_api_shared_lib",
+        "//litert/c/internal:litert_compiler_context",
+        "//litert/cc/dynamic_runtime:litert_extended_model",
+        "//litert/compiler/cc:litert_model",
+        "//litert/test:common",
+        "//litert/test:load_test_model",
+        "//litert/test:test_models",
+        "@intel_openvino//:openvino",
+    ],
+)
+
+litert_lib(
     name = "openvino_compile_context",
     srcs = ["openvino_compile_context.cc"],
     hdrs = ["openvino_compile_context.h"],
