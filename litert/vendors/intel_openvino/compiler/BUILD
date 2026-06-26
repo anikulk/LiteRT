@@ -71,6 +71,7 @@ litert_lib(
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
     deps = [
         "//litert/compiler/cc:litert_model",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
