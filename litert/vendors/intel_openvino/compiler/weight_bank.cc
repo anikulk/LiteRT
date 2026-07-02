@@ -27,6 +27,20 @@
 
 namespace litert::openvino {
 
+namespace {
+// Constants smaller than this are excluded from the shared bank so they stay
+// baked into each partition. Shape-determining control constants (Transpose
+// permutations, gather/reduce axes, Reshape targets, scalars) are read by
+// OpenVINO at compile-time shape inference, but a banked (weightless-tagged)
+// constant has no data at compile time -- the bank file is only written at
+// runtime by the dispatcher -- so tagging them yields a garbage permutation and
+// a compile failure. Every such control constant is bounded by tensor rank
+// (< 6 dims here) and thus at most a few dozen bytes; every shareable real
+// weight (even a norm vector) is far larger, so this threshold separates the
+// two cleanly. A tiny real weight left baked only costs negligible duplication.
+constexpr size_t kMinSharedWeightBytes = 256;
+}  // namespace
+
 void WeightBank::AddSubgraph(const litert::compiler::Subgraph& subgraph) {
   for (const auto& op : subgraph.Ops()) {
     for (const auto& input : op.Inputs()) {
@@ -34,6 +48,10 @@ void WeightBank::AddSubgraph(const litert::compiler::Subgraph& subgraph) {
         continue;
       }
       const auto weights = input.Weights();
+      if (weights.Bytes().size() < kMinSharedWeightBytes) {
+        // Control/shape constant -- leave baked (see kMinSharedWeightBytes).
+        continue;
+      }
       // Keyed by BufferId, so a buffer shared by multiple ops/partitions is
       // recorded once. The bytes are identical for a given id, so re-assignment
       // is harmless.
