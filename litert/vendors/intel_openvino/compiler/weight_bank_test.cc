@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -186,6 +187,39 @@ TEST(WeightBankTest, SerializeBankPlacesBytesAtOffsets) {
       }
     }
   }
+}
+
+// OffsetOfName resolves each weight tensor's name to the same offset as its
+// BufferId, and returns nullopt for names the bank never saw.
+TEST(WeightBankTest, OffsetOfNameResolvesWeightTensors) {
+  auto cc_model = testing::LoadTestFileModel("multi_subgraph.tflite");
+  const LiteRtCompilerContext* ctx = LrtGetCompilerContext();
+  litert::compiler::Model model(ctx, cc_model.Get());
+  WeightBank bank;
+  for (size_t s = 0; s < model.NumSubgraphs(); ++s) {
+    auto graph = model.Subgraph(s);
+    ASSERT_TRUE(graph.HasValue());
+    bank.AddSubgraph(graph.Value());
+  }
+  bank.Finalize();
+
+  size_t named_weights = 0;
+  for (size_t s = 0; s < model.NumSubgraphs(); ++s) {
+    auto graph = model.Subgraph(s);
+    for (const auto& op : graph.Value().Ops()) {
+      for (const auto& input : op.Inputs()) {
+        if (!input.HasWeights()) {
+          continue;
+        }
+        ++named_weights;
+        const auto offset = bank.OffsetOfName(input.Name());
+        ASSERT_TRUE(offset.has_value());
+        EXPECT_EQ(*offset, bank.OffsetOf(input.Weights().BufferId()));
+      }
+    }
+  }
+  EXPECT_GT(named_weights, 0u);
+  EXPECT_EQ(bank.OffsetOfName("no_such_tensor"), std::nullopt);
 }
 
 }  // namespace

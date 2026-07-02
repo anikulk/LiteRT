@@ -17,7 +17,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 #include "absl/types/span.h"  // from @com_google_absl
@@ -25,14 +27,18 @@
 
 namespace litert::openvino {
 
-// Accumulates the set of distinct constant-weight buffers used across one or
-// more partitions of a single compile, so the shared weights can be stored
-// once instead of once per partition.
+// Backs the OpenVINO weightless-caching path: collects the distinct
+// constant-weight buffers used across a model's partitions into one packed
+// bank, so the shared weights are stored once (referenced by every partition's
+// OpenVINO constants via WeightlessCacheAttribute) instead of duplicated per
+// partition.
 //
 // Buffers are keyed by LiteRt Weights::BufferId(): LiteRt's buffer manager
 // assigns the same BufferId to tensors that share storage, so a buffer used by
 // both the prefill and decode partitions is recorded exactly once. The bank
-// owns the layout (id -> bytes -> offset) and can serialize the packed result.
+// owns the layout (id -> bytes -> offset), serializes the packed result, and
+// maps tensor names to offsets so the converted OpenVINO constants (whose
+// friendly_name is the LiteRt tensor name) can be tagged with their offset.
 class WeightBank {
  public:
   WeightBank() = default;
@@ -58,6 +64,12 @@ class WeightBank {
   // Finalize(); returns 0 for an unknown id.
   size_t OffsetOf(int32_t buffer_id) const;
 
+  // Byte offset of the weight tensor named |tensor_name| within the packed
+  // bank, or nullopt if no recorded weight has that name. Tensors that share a
+  // buffer have distinct names but resolve to the same offset. Valid only after
+  // Finalize(); used to tag OpenVINO constants by their friendly_name.
+  std::optional<size_t> OffsetOfName(std::string_view tensor_name) const;
+
   // Total packed bank size in bytes (equals TotalBytes() for a tight pack).
   size_t BankSize() const { return bank_size_; }
 
@@ -69,6 +81,10 @@ class WeightBank {
  private:
   // BufferId -> the buffer's bytes (a view into the model's mmapped weights).
   std::unordered_map<int32_t, absl::Span<const uint8_t>> buffer_bytes_;
+  // Weight tensor name -> its BufferId. Many names may map to one BufferId
+  // (tensors that share storage), which is how shared weights resolve to a
+  // single bank offset.
+  std::unordered_map<std::string, int32_t> name_to_buffer_id_;
   // BufferId -> byte offset in the packed bank, populated by Finalize().
   std::unordered_map<int32_t, size_t> buffer_offsets_;
   // Total packed bank size, set by Finalize().

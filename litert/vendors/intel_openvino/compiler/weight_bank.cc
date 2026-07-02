@@ -18,7 +18,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "litert/compiler/cc/litert_model.h"
@@ -35,7 +37,12 @@ void WeightBank::AddSubgraph(const litert::compiler::Subgraph& subgraph) {
       // Keyed by BufferId, so a buffer shared by multiple ops/partitions is
       // recorded once. The bytes are identical for a given id, so re-assignment
       // is harmless.
-      buffer_bytes_[weights.BufferId()] = weights.Bytes();
+      const int32_t buffer_id = weights.BufferId();
+      buffer_bytes_[buffer_id] = weights.Bytes();
+      // Record this tensor's name so the matching OpenVINO constant (which
+      // takes the tensor name as its friendly_name) can be resolved to an
+      // offset. Distinct names sharing a buffer all point at the same id.
+      name_to_buffer_id_[std::string(input.Name())] = buffer_id;
     }
   }
 }
@@ -69,6 +76,19 @@ void WeightBank::Finalize() {
 size_t WeightBank::OffsetOf(int32_t buffer_id) const {
   auto it = buffer_offsets_.find(buffer_id);
   return it == buffer_offsets_.end() ? 0 : it->second;
+}
+
+std::optional<size_t> WeightBank::OffsetOfName(
+    std::string_view tensor_name) const {
+  auto name_it = name_to_buffer_id_.find(std::string(tensor_name));
+  if (name_it == name_to_buffer_id_.end()) {
+    return std::nullopt;
+  }
+  auto offset_it = buffer_offsets_.find(name_it->second);
+  if (offset_it == buffer_offsets_.end()) {
+    return std::nullopt;
+  }
+  return offset_it->second;
 }
 
 std::string WeightBank::SerializeBank() const {
