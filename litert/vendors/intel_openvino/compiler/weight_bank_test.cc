@@ -16,6 +16,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
+#include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -148,6 +150,42 @@ TEST(WeightBankTest, FinalizeIsDeterministic) {
   WeightBank bank_a = load_bank();
   WeightBank bank_b = load_bank();
   EXPECT_EQ(bank_a.BankSize(), bank_b.BankSize());
+}
+
+// SerializeBank() returns a blob of size BankSize() with each buffer's bytes
+// copied to its assigned offset.
+TEST(WeightBankTest, SerializeBankPlacesBytesAtOffsets) {
+  auto cc_model = testing::LoadTestFileModel("multi_subgraph.tflite");
+  const LiteRtCompilerContext* ctx = LrtGetCompilerContext();
+  litert::compiler::Model model(ctx, cc_model.Get());
+  WeightBank bank;
+  for (size_t s = 0; s < model.NumSubgraphs(); ++s) {
+    auto graph = model.Subgraph(s);
+    ASSERT_TRUE(graph.HasValue());
+    bank.AddSubgraph(graph.Value());
+  }
+  bank.Finalize();
+
+  const std::string blob = bank.SerializeBank();
+  ASSERT_EQ(blob.size(), bank.BankSize());
+
+  // Each weight buffer's bytes must match the blob region at its offset.
+  for (size_t s = 0; s < model.NumSubgraphs(); ++s) {
+    auto graph = model.Subgraph(s);
+    for (const auto& op : graph.Value().Ops()) {
+      for (const auto& input : op.Inputs()) {
+        if (!input.HasWeights()) {
+          continue;
+        }
+        const auto weights = input.Weights();
+        const auto bytes = weights.Bytes();
+        const size_t offset = bank.OffsetOf(weights.BufferId());
+        ASSERT_LE(offset + bytes.size(), blob.size());
+        EXPECT_EQ(0, std::memcmp(blob.data() + offset, bytes.data(),
+                                 bytes.size()));
+      }
+    }
+  }
 }
 
 }  // namespace

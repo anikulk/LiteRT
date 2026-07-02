@@ -17,8 +17,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <unordered_map>
 
+#include "absl/types/span.h"  // from @com_google_absl
 #include "litert/compiler/cc/litert_model.h"
 
 namespace litert::openvino {
@@ -30,7 +32,7 @@ namespace litert::openvino {
 // Buffers are keyed by LiteRt Weights::BufferId(): LiteRt's buffer manager
 // assigns the same BufferId to tensors that share storage, so a buffer used by
 // both the prefill and decode partitions is recorded exactly once. The bank
-// owns only the layout (id -> size, and later id -> offset).
+// owns the layout (id -> bytes -> offset) and can serialize the packed result.
 class WeightBank {
  public:
   WeightBank() = default;
@@ -41,7 +43,7 @@ class WeightBank {
   void AddSubgraph(const litert::compiler::Subgraph& subgraph);
 
   // Number of distinct weight buffers recorded so far.
-  size_t NumBuffers() const { return buffer_sizes_.size(); }
+  size_t NumBuffers() const { return buffer_bytes_.size(); }
 
   // Total bytes across all distinct buffers (i.e. the deduplicated weight size).
   size_t TotalBytes() const;
@@ -59,9 +61,14 @@ class WeightBank {
   // Total packed bank size in bytes (equals TotalBytes() for a tight pack).
   size_t BankSize() const { return bank_size_; }
 
+  // Returns the packed bank: every distinct buffer's bytes copied to its
+  // assigned offset, so the result has size BankSize(). Must be called after
+  // Finalize().
+  std::string SerializeBank() const;
+
  private:
-  // BufferId -> buffer size in bytes.
-  std::unordered_map<int32_t, size_t> buffer_sizes_;
+  // BufferId -> the buffer's bytes (a view into the model's mmapped weights).
+  std::unordered_map<int32_t, absl::Span<const uint8_t>> buffer_bytes_;
   // BufferId -> byte offset in the packed bank, populated by Finalize().
   std::unordered_map<int32_t, size_t> buffer_offsets_;
   // Total packed bank size, set by Finalize().
