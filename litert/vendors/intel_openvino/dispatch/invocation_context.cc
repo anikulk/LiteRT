@@ -18,16 +18,21 @@
 #include <algorithm>
 #include <chrono>  // NOLINT
 #include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <ios>
 #include <istream>
 #include <streambuf>
 #include <string>
 #include <vector>
 
+#include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "openvino/core/any.hpp"
 #include "openvino/runtime/compiled_model.hpp"
+#include "openvino/runtime/properties.hpp"
 #include "openvino/runtime/tensor.hpp"
 #include "litert/c/internal/litert_logging.h"
 #include "litert/c/internal/litert_runtime_context.h"
@@ -125,6 +130,81 @@ class SharedStreamBuffer : public std::streambuf {
   size_t offset_;
 };
 
+// Frame prepended by the compiler to partition 0's bytecode in embedded
+// weight-sharing mode: "WLBANK\0\0" + uint64 bank_size (LE) + [bank bytes].
+constexpr char kBankMagic[8] = {'W', 'L', 'B', 'A', 'N', 'K', 0, 0};
+constexpr size_t kBankFrameHeader = sizeof(kBankMagic) + sizeof(uint64_t);
+
+// Process-wide path of the shared weights bank once it has been extracted to a
+// temp file. The compiler embeds the bank in a single partition, but every
+// partition needs weights_path at import; the first partition to see the frame
+// writes the temp file and records its path here, and the others reuse it.
+absl::Mutex& BankPathMutex() {
+  static absl::Mutex* mu = new absl::Mutex();
+  return *mu;
+}
+std::string& SharedBankPath() ABSL_EXCLUSIVE_LOCKS_REQUIRED(BankPathMutex()) {
+  static std::string* path = new std::string();
+  return *path;
+}
+
+// If |bytecode| begins with the WLBANK frame, extracts the bank to a temp .bin
+// file exactly once (recording the path for later partitions), advances
+// |bytecode|/|size| past the frame to the weightless payload, and returns the
+// bank path. Otherwise returns any previously extracted bank path (empty if
+// none). OpenVINO's weights_path requires a filesystem path ending in ".bin".
+litert::Expected<std::string> MaybeExtractWeightsBank(const uint8_t*& bytecode,
+                                                      size_t& size) {
+  const bool has_frame =
+      size >= kBankFrameHeader &&
+      std::memcmp(bytecode, kBankMagic, sizeof(kBankMagic)) == 0;
+  if (!has_frame) {
+    absl::MutexLock lock(&BankPathMutex());
+    return SharedBankPath();  // may be empty (no embedded bank in this model)
+  }
+
+  uint64_t bank_size = 0;
+  std::memcpy(&bank_size, bytecode + sizeof(kBankMagic), sizeof(bank_size));
+  if (kBankFrameHeader + bank_size > size) {
+    return litert::Error(kLiteRtStatusErrorRuntimeFailure,
+                         "WLBANK frame size exceeds bytecode buffer");
+  }
+  const uint8_t* bank_data = bytecode + kBankFrameHeader;
+
+  absl::MutexLock lock(&BankPathMutex());
+  std::string& shared_path = SharedBankPath();
+  if (shared_path.empty()) {
+    const char* tmp_dir = std::getenv("TMPDIR");
+    if (tmp_dir == nullptr || tmp_dir[0] == '\0') tmp_dir = "/tmp";
+    // The device buffer is per-process and identical across partitions, so a
+    // fixed name is sufficient; the .bin extension is required by the GPU
+    // plugin's weightless importer.
+    std::string path =
+        std::string(tmp_dir) + "/litert_ov_weights_bank.bin";
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      return litert::Error(kLiteRtStatusErrorRuntimeFailure,
+                           "Cannot open temp weights bank for writing: " + path);
+    }
+    out.write(reinterpret_cast<const char*>(bank_data),
+              static_cast<std::streamsize>(bank_size));
+    out.close();
+    if (!out) {
+      return litert::Error(kLiteRtStatusErrorRuntimeFailure,
+                           "Failed writing temp weights bank: " + path);
+    }
+    shared_path = path;
+    LITERT_LOG(LITERT_INFO,
+               "Extracted embedded weights bank (%llu bytes) -> %s",
+               static_cast<unsigned long long>(bank_size), shared_path.c_str());
+  }
+
+  // Advance past the frame to the weightless payload.
+  bytecode += kBankFrameHeader + bank_size;
+  size -= kBankFrameHeader + bank_size;
+  return shared_path;
+}
+
 }  // namespace
 
 litert::Expected<LiteRtDispatchInvocationContextT::Ptr>
@@ -205,6 +285,17 @@ LiteRtDispatchInvocationContextT::Create(
     return litert::Error(kLiteRtStatusErrorRuntimeFailure,
                          "Empty bytecode buffer");
   }
+
+  // Embedded weight-sharing: if the compiler prepended the shared weights bank
+  // (WLBANK frame, on partition 0), extract it to a temp .bin once and peel the
+  // frame off so only the weightless payload is imported. Every partition then
+  // imports weightless with weights_path pointing at that shared bank.
+  auto bytecode_cursor = static_cast<const uint8_t*>(exec_bytecode_ptr);
+  LITERT_ASSIGN_OR_RETURN(
+      const std::string weights_bank_path,
+      MaybeExtractWeightsBank(bytecode_cursor, exec_bytecode_size));
+  exec_bytecode_ptr = bytecode_cursor;
+
   SharedStreamBuffer membuf(static_cast<const char*>(exec_bytecode_ptr),
                             exec_bytecode_size);
   std::istream model_stream(&membuf);
@@ -214,7 +305,17 @@ LiteRtDispatchInvocationContextT::Create(
   }
   ov::CompiledModel compiled_model;
   try {
-    compiled_model = core->import_model(model_stream, device);
+    if (!weights_bank_path.empty()) {
+      LITERT_LOG(LITERT_INFO,
+                 "Importing weightless model with shared weights bank '%s'",
+                 weights_bank_path.c_str());
+      compiled_model = core->import_model(
+          model_stream, device,
+          {ov::cache_mode(ov::CacheMode::OPTIMIZE_SIZE),
+           ov::enable_weightless(true), ov::weights_path(weights_bank_path)});
+    } else {
+      compiled_model = core->import_model(model_stream, device);
+    }
   } catch (const std::exception& e) {
     return litert::Error(kLiteRtStatusErrorRuntimeFailure, e.what());
   }
