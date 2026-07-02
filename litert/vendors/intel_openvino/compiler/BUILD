@@ -251,6 +251,8 @@ litert_bin(
         ":litert_compiler_plugin_c_api",
         ":openvino_compile_context",
         ":openvino_soc_config",
+        ":weight_bank",
+        ":weightless_tagging",
         "//litert/c:litert_common",
         "//litert/c:litert_op_code",
         "//litert/c:litert_op_options_header",
