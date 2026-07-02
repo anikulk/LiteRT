@@ -46,9 +46,26 @@ class WeightBank {
   // Total bytes across all distinct buffers (i.e. the deduplicated weight size).
   size_t TotalBytes() const;
 
+  // Assigns each recorded buffer a byte offset in a single tightly-packed bank.
+  // Offsets are assigned in ascending BufferId order so the layout is
+  // deterministic across runs (independent of op/subgraph iteration order).
+  // Call once after all subgraphs have been added.
+  void Finalize();
+
+  // Byte offset of |buffer_id| within the packed bank. Valid only after
+  // Finalize(); returns 0 for an unknown id.
+  size_t OffsetOf(int32_t buffer_id) const;
+
+  // Total packed bank size in bytes (equals TotalBytes() for a tight pack).
+  size_t BankSize() const { return bank_size_; }
+
  private:
   // BufferId -> buffer size in bytes.
   std::unordered_map<int32_t, size_t> buffer_sizes_;
+  // BufferId -> byte offset in the packed bank, populated by Finalize().
+  std::unordered_map<int32_t, size_t> buffer_offsets_;
+  // Total packed bank size, set by Finalize().
+  size_t bank_size_ = 0;
 };
 
 }  // namespace litert::openvino
