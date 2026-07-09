@@ -91,6 +91,15 @@ std::optional<size_t> WeightBank::OffsetOfName(
   return offset_it->second;
 }
 
+std::optional<int32_t> WeightBank::BufferIdOfName(
+    std::string_view tensor_name) const {
+  auto name_it = name_to_buffer_id_.find(std::string(tensor_name));
+  if (name_it == name_to_buffer_id_.end()) {
+    return std::nullopt;
+  }
+  return name_it->second;
+}
+
 std::string WeightBank::SerializeBank() const {
   // Produces the single weights file that the runtime mmaps via weights_path:
   // every distinct buffer copied to the offset assigned in Finalize(). This is

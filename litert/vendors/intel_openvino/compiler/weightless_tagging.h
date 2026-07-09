@@ -16,6 +16,8 @@
 #define LITERT_VENDORS_INTEL_OPENVINO_COMPILER_WEIGHTLESS_TAGGING_H_
 
 #include <cstddef>
+#include <cstdint>
+#include <map>
 #include <memory>
 
 #include "openvino/core/model.hpp"
@@ -31,9 +33,17 @@ namespace litert::openvino {
 // bank does not know (e.g. small scalars the frontend synthesizes) are left
 // untouched. |bank| must already be Finalize()-d.
 //
+// If |const_map| is non-null, it is populated with the GlobalGraph-style
+// mapping (a per-model constant ordinal -> shared BufferId) for every tagged
+// constant, mirroring the upstream reference plugin's const_map. This is
+// carried in the container as reference-parity metadata; OpenVINO itself
+// resolves the weights via the WeightlessCacheAttribute + weights_path, not the
+// const_map.
+//
 // Returns the number of constants tagged.
 size_t TagWeightlessConstants(const std::shared_ptr<ov::Model>& model,
-                              const WeightBank& bank);
+                              const WeightBank& bank,
+                              std::map<uint32_t, uint32_t>* const_map = nullptr);
 
 }  // namespace litert::openvino
 

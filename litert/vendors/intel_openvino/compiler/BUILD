@@ -114,6 +114,18 @@ litert_test(
 )
 
 litert_lib(
+    name = "global_graph",
+    srcs = ["global_graph.cc"],
+    hdrs = ["global_graph.h"],
+    copts = ["-fexceptions"],
+    features = ["-use_header_modules"],  # Incompatible with -fexceptions.
+    visibility = ["//litert/vendors/intel_openvino:__subpackages__"],
+    deps = [
+        "//litert/cc:litert_expected",
+    ],
+)
+
+litert_lib(
     name = "weightless_tagging",
     srcs = ["weightless_tagging.cc"],
     hdrs = ["weightless_tagging.h"],
@@ -205,6 +217,7 @@ litert_dynamic_lib(
         ":openvino_compile_context",
         ":weight_bank",
         ":weightless_tagging",
+        ":global_graph",
         ":openvino_soc_config",
         "//litert/c:litert_builder_header",
         "//litert/c:litert_common",
@@ -253,6 +266,7 @@ litert_bin(
         ":openvino_soc_config",
         ":weight_bank",
         ":weightless_tagging",
+        ":global_graph",
         "//litert/c:litert_common",
         "//litert/c:litert_op_code",
         "//litert/c:litert_op_options_header",

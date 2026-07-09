@@ -15,6 +15,8 @@
 #include "litert/vendors/intel_openvino/compiler/weightless_tagging.h"
 
 #include <cstddef>
+#include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 
@@ -41,13 +43,19 @@ namespace litert::openvino {
 constexpr size_t kMinWeightlessTagBytes = 256;
 
 size_t TagWeightlessConstants(const std::shared_ptr<ov::Model>& model,
-                              const WeightBank& bank) {
+                              const WeightBank& bank,
+                              std::map<uint32_t, uint32_t>* const_map) {
   size_t tagged = 0;
+  uint32_t ordinal = 0;
   for (const auto& node : model->get_ops()) {
     auto constant = ov::as_type_ptr<ov::op::v0::Constant>(node);
     if (!constant) {
       continue;
     }
+    // Stable per-model ordinal over Constant nodes; used as the const_map key
+    // (the GlobalGraph reference keys const_map by the op's input index -- we
+    // use the constant's ordinal here as the equivalent stable handle).
+    const uint32_t this_ordinal = ordinal++;
     // The TFLite frontend names a weight constant after its LiteRt tensor, so
     // the bank can resolve it to a bank offset. Constants the bank never saw
     // (e.g. axis/scalar constants the frontend synthesizes) return nullopt and
@@ -66,6 +74,13 @@ size_t TagWeightlessConstants(const std::shared_ptr<ov::Model>& model,
     constant->get_rt_info()[ov::WeightlessCacheAttribute::get_type_info_static()] =
         ov::WeightlessCacheAttribute(constant->get_byte_size(), *offset,
                                      constant->get_element_type());
+    if (const_map != nullptr) {
+      const std::optional<int32_t> buffer_id =
+          bank.BufferIdOfName(constant->get_friendly_name());
+      if (buffer_id.has_value()) {
+        (*const_map)[this_ordinal] = static_cast<uint32_t>(*buffer_id);
+      }
+    }
     ++tagged;
   }
   return tagged;

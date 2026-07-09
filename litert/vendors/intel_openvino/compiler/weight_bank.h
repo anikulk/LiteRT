@@ -70,6 +70,12 @@ class WeightBank {
   // Finalize(); used to tag OpenVINO constants by their friendly_name.
   std::optional<size_t> OffsetOfName(std::string_view tensor_name) const;
 
+  // BufferId of the weight tensor named |tensor_name|, or nullopt if unknown.
+  // Used to build the GlobalGraph const_map (OV constant -> shared buffer id),
+  // mirroring the upstream reference's const_map. Valid any time after
+  // AddSubgraph() (does not require Finalize()).
+  std::optional<int32_t> BufferIdOfName(std::string_view tensor_name) const;
+
   // Total packed bank size in bytes (equals TotalBytes() for a tight pack).
   size_t BankSize() const { return bank_size_; }
 
@@ -77,6 +83,13 @@ class WeightBank {
   // assigned offset, so the result has size BankSize(). Must be called after
   // Finalize().
   std::string SerializeBank() const;
+
+  // The deduplicated buffer pool as (BufferId -> bytes view), for populating the
+  // GlobalGraph shared buffer pool. Available after AddSubgraph() calls.
+  const std::unordered_map<int32_t, absl::Span<const uint8_t>>& Buffers()
+      const {
+    return buffer_bytes_;
+  }
 
  private:
   // BufferId -> the buffer's bytes (a view into the model's mmapped weights).

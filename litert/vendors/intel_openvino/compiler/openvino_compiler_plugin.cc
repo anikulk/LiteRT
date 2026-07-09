@@ -52,6 +52,7 @@
 #include "litert/vendors/intel_openvino/compiler/graph_iterator.h"
 #include "litert/vendors/intel_openvino/compiler/openvino_compile_context.h"
 #include "litert/vendors/intel_openvino/compiler/openvino_soc_config.h"
+#include "litert/vendors/intel_openvino/compiler/global_graph.h"
 #include "litert/vendors/intel_openvino/compiler/weight_bank.h"
 #include "litert/vendors/intel_openvino/compiler/weightless_tagging.h"
 
@@ -324,7 +325,14 @@ LiteRtStatus LiteRtGetCompiledResultCallInfo(
   auto& graph_name = compiled_result->graph_names[call_idx];
   *call_info = graph_name.data();
   *call_info_size = graph_name.size();
-  *byte_code_idx = call_idx;
+  // Weight-sharing (GlobalGraph) aggregates all partitions into a single
+  // container stored once in byte_code[0]; every call reads that same blob and
+  // selects its own subgraph inside the dispatcher (by graph_name). Non-shared
+  // builds keep one bytecode module per partition (idx == call_idx).
+  *byte_code_idx = (compiled_result->byte_code.size() == 1 &&
+                    compiled_result->graph_names.size() > 1)
+                       ? 0
+                       : call_idx;
 
   return kLiteRtStatusOk;
 }
@@ -503,37 +511,38 @@ LiteRtStatus LiteRtCompilerPluginCompile(
     auto tflite_fe =
         std::make_shared<ov::frontend::tensorflow_lite::FrontEnd>();
 
-    // Cross-partition weight sharing (opt-in via LITERT_OV_EMBED_WEIGHTS=1).
-    // All partitions' distinct constant weights are deduplicated (by LiteRt
-    // BufferId) into one shared bank; each partition is compiled weightless,
-    // tagging its constants with offsets into that bank so the weights live
-    // once at runtime. The packed bank is framed and prepended to partition 0's
-    // bytecode, so the compiled model stays a single self-contained .tflite;
-    // the dispatcher peels the frame and extracts the bank for OpenVINO's
-    // weights_path.
+    // Cross-partition weight sharing (opt-in via LITERT_OV_EMBED_WEIGHTS=1),
+    // structured after the upstream reference GlobalGraph pattern (commit
+    // 20da64b8): all partitions' distinct constant weights are deduplicated
+    // (by LiteRt BufferId) into ONE OpenVinoGlobalGraph container -- a shared
+    // buffer pool + per-subgraph {weightless payload, const_map, device}. The
+    // SAME serialized container blob is returned for every partition (see
+    // LiteRtGetCompiledResultByteCode). At runtime the dispatcher parses the
+    // container, selects its subgraph, materializes the pool once to a file for
+    // OpenVINO's weights_path, and imports the weightless payload.
+    //
+    // (OV adaptation vs the reference: OV cannot attach pooled buffers as
+    // runtime inputs, so weight resolution still uses WeightlessCacheAttribute +
+    // weights_path; the const_map is carried as reference-parity metadata.)
     litert::openvino::WeightBank weight_bank;
+    litert::openvino::OpenVinoGlobalGraph global_graph;
     const char* embed_env = std::getenv("LITERT_OV_EMBED_WEIGHTS");
     const bool share_weights = embed_env != nullptr && embed_env[0] == '1';
-    // Packed bank frame prepended to partition 0:
-    //   "WLBANK\0\0" (8 bytes) + uint64 bank_size (LE) + [bank bytes]
-    std::string embedded_bank_frame;
     if (share_weights) {
       for (int p = 0; p < num_partitions; ++p) {
         auto sg = model.Subgraph(p);
         if (sg.HasValue()) weight_bank.AddSubgraph(sg.Value());
       }
       weight_bank.Finalize();
-      const std::string bank = weight_bank.SerializeBank();
       LITERT_LOG(LITERT_INFO, "Weight sharing: %zu buffers, bank %zu bytes",
                  weight_bank.NumBuffers(), weight_bank.BankSize());
-      static constexpr char kBankMagic[8] = {'W', 'L', 'B', 'A', 'N', 'K', 0, 0};
-      const uint64_t bank_size = bank.size();
-      embedded_bank_frame.reserve(sizeof(kBankMagic) + sizeof(bank_size) +
-                                  bank.size());
-      embedded_bank_frame.append(kBankMagic, sizeof(kBankMagic));
-      embedded_bank_frame.append(reinterpret_cast<const char*>(&bank_size),
-                                 sizeof(bank_size));
-      embedded_bank_frame.append(bank);
+      // Populate the GlobalGraph shared buffer pool (BufferId -> bytes).
+      for (const auto& [buffer_id, bytes] : weight_bank.Buffers()) {
+        global_graph.buffers.emplace(
+            static_cast<uint32_t>(buffer_id),
+            std::string(reinterpret_cast<const char*>(bytes.data()),
+                        bytes.size()));
+      }
     }
 
     ov::Core core;
@@ -564,11 +573,13 @@ LiteRtStatus LiteRtCompilerPluginCompile(
 
         // For shared-weights builds, tag this partition's weight constants with
         // their offset in the shared bank and compile weightless so the bytes
-        // are referenced (not baked) from the bank file at runtime.
+        // are referenced (not baked) from the bank file at runtime. Also collect
+        // the GlobalGraph const_map (constant ordinal -> shared BufferId).
         ov::AnyMap configs = context.ConfigsMap();
+        std::map<uint32_t, uint32_t> const_map;
         if (share_weights) {
-          const size_t tagged =
-              litert::openvino::TagWeightlessConstants(ov_model, weight_bank);
+          const size_t tagged = litert::openvino::TagWeightlessConstants(
+              ov_model, weight_bank, &const_map);
           configs[ov::cache_mode.name()] = ov::CacheMode::OPTIMIZE_SIZE;
           configs[ov::enable_weightless.name()] = true;
           LITERT_LOG(LITERT_INFO,
@@ -598,28 +609,46 @@ LiteRtStatus LiteRtCompilerPluginCompile(
         else if (dev == "GPU")
           graph_backend_enum = kLiteRtIntelOpenVinoGraphBackendGPU;
 
-        // Prepend a self-describing header so the dispatcher knows which
-        // device the bytecode was compiled for. In EMBEDDED weight-sharing
-        // mode, the shared bank frame is inserted after the device header on
-        // partition 0 only, so the bank is stored exactly once; the dispatcher
-        // peels it before importing the weightless payload.
-        std::string bank_frame;
-        if (share_weights && partition_idx == 0) {
-          bank_frame = std::move(embedded_bank_frame);
-          LITERT_LOG(LITERT_INFO,
-                     "Weight sharing: embedded bank frame (%zu bytes) into "
-                     "partition 0 bytecode",
-                     bank_frame.size());
+        if (share_weights) {
+          // Aggregate this partition into the GlobalGraph container instead of
+          // emitting standalone per-partition bytecode. The device-headered
+          // weightless payload becomes this subgraph's payload; the whole
+          // container is serialized once after the loop and returned for every
+          // partition index.
+          litert::openvino::OpenVinoGlobalGraph::Subgraph gg_sg;
+          gg_sg.name = graph_name;
+          gg_sg.device = static_cast<uint8_t>(graph_backend_enum);
+          gg_sg.const_map = std::move(const_map);
+          gg_sg.payload =
+              litert::openvino::MakeBytecodeHeader(graph_backend_enum) +
+              obuf.drain_str();
+          global_graph.subgraphs.emplace(graph_name, std::move(gg_sg));
+        } else {
+          // Non-shared path: standalone per-partition bytecode (device header +
+          // baked-weights payload).
+          result->byte_code[partition_idx] =
+              litert::openvino::MakeBytecodeHeader(graph_backend_enum) +
+              obuf.drain_str();
         }
-        result->byte_code[partition_idx] =
-            litert::openvino::MakeBytecodeHeader(graph_backend_enum) +
-            bank_frame + obuf.drain_str();
 
-        result->graph_names.emplace_back(graph_name);
+        result->graph_names[partition_idx] = graph_name;
       } else {
         LITERT_LOG(LITERT_INFO, "Failed to retrieve Subgraph");
         return kLiteRtStatusErrorCompilation;
       }
+    }
+    if (share_weights) {
+      // Serialize the whole GlobalGraph ONCE into byte_code[0] and point every
+      // partition's call at byte_code_idx 0 (see LiteRtGetCompiledResultCallInfo).
+      // This matches the upstream reference (one shared blob) and, critically,
+      // stores the ~multi-GB buffer pool exactly once in the .tflite -- copying
+      // it into N per-partition slots would N-x the file and defeat sharing.
+      result->byte_code.assign(1, global_graph.Serialize());
+      LITERT_LOG(LITERT_INFO,
+                 "Weight sharing: GlobalGraph container %zu bytes "
+                 "(%zu buffers, %zu subgraphs)",
+                 result->byte_code[0].size(), global_graph.buffers.size(),
+                 global_graph.subgraphs.size());
     }
     *compiled_result = result.release();
     // TODO: Add support for caching
