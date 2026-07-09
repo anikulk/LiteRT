@@ -25,6 +25,21 @@
 
 namespace litert::openvino {
 
+// Constants at or below this size are never tagged weightless, even though they
+// remain recorded in the shared bank (so every larger weight keeps its bank
+// offset). Shape-determining control constants -- Transpose permutations,
+// gather/reduce axes, Reshape targets, scalars -- are read by OpenVINO during
+// compile-time shape inference, but a weightless-tagged constant carries no data
+// at compile time (the bank file is only materialized at runtime by the
+// dispatcher), so tagging one yields a garbage permutation and a compile crash
+// (e.g. "Permutation AxisVector{0,0,2,0} is not valid"). These control constants
+// are bounded by tensor rank (< 6 dims) and thus at most a few dozen bytes, while
+// every shareable real weight is far larger, so the threshold separates them
+// cleanly. Leaving a sub-threshold constant baked costs only negligible
+// duplication; crucially it stays in the bank, so real-weight bank offsets are
+// unchanged from the all-buffers layout.
+constexpr size_t kMinWeightlessTagBytes = 256;
+
 size_t TagWeightlessConstants(const std::shared_ptr<ov::Model>& model,
                               const WeightBank& bank) {
   size_t tagged = 0;
@@ -40,6 +55,12 @@ size_t TagWeightlessConstants(const std::shared_ptr<ov::Model>& model,
     const std::optional<size_t> offset =
         bank.OffsetOfName(constant->get_friendly_name());
     if (!offset.has_value()) {
+      continue;
+    }
+    // Small control/shape constants stay baked so compile-time shape inference
+    // can read their values (see kMinWeightlessTagBytes). They remain in the
+    // bank, preserving every larger weight's offset.
+    if (constant->get_byte_size() <= kMinWeightlessTagBytes) {
       continue;
     }
     constant->get_rt_info()[ov::WeightlessCacheAttribute::get_type_info_static()] =
