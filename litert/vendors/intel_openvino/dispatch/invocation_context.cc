@@ -271,13 +271,28 @@ LiteRtDispatchInvocationContextT::Create(
 
   // Resolve a GlobalGraph subgraph's weights against the shared pool: on GPU the
   // weights are Parameters imported plainly, then bound to views into a shared
-  // usm-host buffer (below). A non-shared model (no container) imports its
-  // payload directly. Weight sharing is GPU-only; non-GPU shared models are
-  // rejected at compile time (a later patchset adds the NPU arm).
+  // usm-host buffer; on other devices they are weightless constants pulled from a
+  // shared bank file. A non-shared model (no container) imports its payload
+  // directly.
   const bool gpu_shared = global_graph.has_value() && device == "GPU";
   ov::CompiledModel compiled_model;
   try {
-    compiled_model = core->import_model(model_stream, device);
+    if (gpu_shared) {
+      compiled_model = core->import_model(model_stream, device);
+    } else if (global_graph.has_value()) {
+      LITERT_ASSIGN_OR_RETURN(
+          std::string weights_path,
+          litert::openvino::WriteWeightsBankFile(*global_graph));
+      LITERT_LOG(LITERT_INFO,
+                 "Importing weightless model with shared weights bank '%s'",
+                 weights_path.c_str());
+      compiled_model = core->import_model(
+          model_stream, device,
+          {ov::cache_mode(ov::CacheMode::OPTIMIZE_SIZE),
+           ov::enable_weightless(true), ov::weights_path(weights_path)});
+    } else {
+      compiled_model = core->import_model(model_stream, device);
+    }
   } catch (const std::exception& e) {
     return litert::Error(kLiteRtStatusErrorRuntimeFailure, e.what());
   }

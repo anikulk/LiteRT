@@ -36,6 +36,12 @@ struct BoundWeight {
   ov::Tensor view;     // view into the shared usm-host buffer (zero-copy)
 };
 
+// Writes the GlobalGraph shared buffer pool to a temp .bin once per process and
+// returns its path, for import with ov::weights_path. Later partitions reuse the
+// same file. Packs buffers in ascending BufferId order.
+litert::Expected<std::string> WriteWeightsBankFile(
+    const OpenVinoGlobalGraph& global_graph);
+
 // Allocates one shared usm-host buffer holding the pool (once per process) and
 // returns a view into it for each of |compiled_model|'s weight-Parameters named
 // in |const_map| (input_index -> BufferId). The caller sets each view on the

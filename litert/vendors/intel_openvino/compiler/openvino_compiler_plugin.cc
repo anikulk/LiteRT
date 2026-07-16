@@ -54,6 +54,7 @@
 #include "litert/vendors/intel_openvino/compiler/openvino_soc_config.h"
 #include "litert/vendors/intel_openvino/compiler/global_graph.h"
 #include "litert/vendors/intel_openvino/compiler/weight_bank.h"
+#include "litert/vendors/intel_openvino/compiler/weightless_tagging.h"
 #include "litert/vendors/intel_openvino/compiler/weights_to_parameters.h"
 
 namespace {
@@ -529,6 +530,9 @@ LiteRtStatus LiteRtCompilerPluginCompile(
         auto subgraph = model.Subgraph(p);
         if (subgraph.HasValue()) weight_bank.AddSubgraph(subgraph.Value());
       }
+      // Finalize assigns packed-bank offsets, needed by the weightless (NPU)
+      // arm to tag constants against the shared bank file. Harmless on GPU.
+      weight_bank.Finalize();
       LITERT_LOG(LITERT_INFO, "Weight sharing: %zu buffers, %zu bytes",
                  weight_bank.NumBuffers(), weight_bank.TotalBytes());
       // Populate the GlobalGraph shared buffer pool (BufferId -> bytes).
@@ -569,23 +573,28 @@ LiteRtStatus LiteRtCompilerPluginCompile(
         ov::AnyMap configs = context.ConfigsMap();
         std::map<uint32_t, uint32_t> const_map;
         if (share_weights) {
-          // Weight sharing is currently GPU-only. Other devices (NPU/CPU) are a
-          // later patchset; fail loudly rather than emit an unshared model.
-          if (context.Device() != "GPU") {
-            LITERT_LOG(LITERT_ERROR,
-                       "Weight sharing is only supported on GPU (partition %d "
-                       "targets '%s')",
-                       partition_idx, context.Device().c_str());
-            return kLiteRtStatusErrorUnsupported;
+          if (context.Device() == "GPU") {
+            // Convert weights to Parameters bound to the shared bank at
+            // dispatch; const_map records input_index -> BufferId.
+            const size_t converted =
+                litert::openvino::ConvertWeightsToParameters(
+                    ov_model, weight_bank, &const_map);
+            LITERT_LOG(LITERT_INFO,
+                       "Weight sharing: converted %zu weights to parameters "
+                       "in partition %d",
+                       converted, partition_idx);
+          } else {
+            // Tag weight constants with their bank offset and compile weightless
+            // so the bytes are referenced from the bank file at runtime;
+            // const_map records constant ordinal -> BufferId.
+            const size_t tagged = litert::openvino::TagWeightlessConstants(
+                ov_model, weight_bank, &const_map);
+            configs[ov::cache_mode.name()] = ov::CacheMode::OPTIMIZE_SIZE;
+            configs[ov::enable_weightless.name()] = true;
+            LITERT_LOG(LITERT_INFO,
+                       "Weight sharing: tagged %zu constants in partition %d",
+                       tagged, partition_idx);
           }
-          // Convert weights to Parameters bound to the shared bank at dispatch;
-          // const_map records input_index -> BufferId.
-          const size_t converted = litert::openvino::ConvertWeightsToParameters(
-              ov_model, weight_bank, &const_map);
-          LITERT_LOG(LITERT_INFO,
-                     "Weight sharing: converted %zu weights to parameters "
-                     "in partition %d",
-                     converted, partition_idx);
         }
 
         // Compile using the per-partition device and properties.
@@ -613,9 +622,9 @@ LiteRtStatus LiteRtCompilerPluginCompile(
         if (share_weights) {
           // Aggregate this partition into the GlobalGraph container instead of
           // emitting standalone per-partition bytecode. The device-headered
-          // payload becomes this subgraph's payload; the whole container is
-          // serialized once after the loop and returned for every partition
-          // index.
+          // weightless payload becomes this subgraph's payload; the whole
+          // container is serialized once after the loop and returned for every
+          // partition index.
           litert::openvino::OpenVinoGlobalGraph::Subgraph subgraph;
           subgraph.name = graph_name;
           subgraph.device = static_cast<uint8_t>(graph_backend_enum);

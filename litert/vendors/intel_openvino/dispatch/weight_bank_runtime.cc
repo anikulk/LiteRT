@@ -17,7 +17,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <ios>
 #include <map>
 #include <string>
 #include <vector>
@@ -36,7 +39,18 @@
 namespace litert::openvino {
 namespace {
 
-// The shared pool is held in one usm-host buffer per process; the first
+// Weightless arm: the shared pool is written to one temp .bin per process; the
+// first partition writes it and records the path here, and the others reuse it.
+absl::Mutex& BankPathMutex() {
+  static absl::Mutex* mu = new absl::Mutex();
+  return *mu;
+}
+std::string& SharedBankPath() ABSL_EXCLUSIVE_LOCKS_REQUIRED(BankPathMutex()) {
+  static std::string* path = new std::string();
+  return *path;
+}
+
+// GPU arm: the shared pool is held in one usm-host buffer per process; the first
 // partition allocates and fills it, and the others bind views into it.
 struct GpuBank {
   ov::RemoteTensor usm;               // usm-host buffer holding the whole pool
@@ -54,6 +68,41 @@ GpuBank& SharedGpuBank() ABSL_EXCLUSIVE_LOCKS_REQUIRED(GpuBankMutex()) {
 }
 
 }  // namespace
+
+litert::Expected<std::string> WriteWeightsBankFile(
+    const OpenVinoGlobalGraph& global_graph) {
+  absl::MutexLock lock(&BankPathMutex());
+  std::string& shared_path = SharedBankPath();
+  if (!shared_path.empty()) {
+    return shared_path;
+  }
+  const char* tmp_dir = std::getenv("TMPDIR");
+  if (tmp_dir == nullptr || tmp_dir[0] == '\0') tmp_dir = "/tmp";
+  const std::string path = std::string(tmp_dir) + "/litert_ov_weights_bank.bin";
+
+  // global_graph.buffers is a std::map<uint32_t,...>, so iteration is in
+  // ascending BufferId order -- the packing the compiler's bank offsets assume.
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    return litert::Error(kLiteRtStatusErrorRuntimeFailure,
+                         "Cannot open temp weights bank for writing: " + path);
+  }
+  size_t total = 0;
+  for (const auto& [buffer_id, bytes] : global_graph.buffers) {
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    total += bytes.size();
+  }
+  out.close();
+  if (!out) {
+    return litert::Error(kLiteRtStatusErrorRuntimeFailure,
+                         "Failed writing temp weights bank: " + path);
+  }
+  shared_path = path;
+  LITERT_LOG(LITERT_INFO,
+             "GlobalGraph: wrote shared weights bank (%zu bytes) -> %s", total,
+             shared_path.c_str());
+  return shared_path;
+}
 
 litert::Expected<std::vector<BoundWeight>> BindSharedWeightsGpu(
     ov::Core& core, const OpenVinoGlobalGraph& global_graph,
