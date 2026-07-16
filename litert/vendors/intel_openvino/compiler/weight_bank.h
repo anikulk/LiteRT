@@ -66,6 +66,31 @@ class WeightBank {
     return buffer_bytes_;
   }
 
+  // Assigns each recorded buffer a byte offset in a single tightly-packed bank.
+  // Offsets are assigned in ascending BufferId order so the layout is
+  // deterministic across runs (independent of op/subgraph iteration order).
+  // Call once after all subgraphs have been added. Used by the weightless
+  // (NPU) arm, which references the packed bank file by offset via weights_path.
+  void Finalize();
+
+  // Byte offset of |buffer_id| within the packed bank. Valid only after
+  // Finalize(); returns 0 for an unknown id.
+  size_t OffsetOf(int32_t buffer_id) const;
+
+  // Byte offset of the weight tensor named |tensor_name| within the packed
+  // bank, or nullopt if no recorded weight has that name. Tensors that share a
+  // buffer have distinct names but resolve to the same offset. Valid only after
+  // Finalize(); used to tag weightless OpenVINO constants by their friendly_name.
+  std::optional<size_t> OffsetOfName(std::string_view tensor_name) const;
+
+  // Total packed bank size in bytes (equals TotalBytes() for a tight pack).
+  size_t BankSize() const { return bank_size_; }
+
+  // Returns the packed bank: every distinct buffer's bytes copied to its
+  // assigned offset, so the result has size BankSize(). Must be called after
+  // Finalize().
+  std::string SerializeBank() const;
+
  private:
   // BufferId -> the buffer's bytes (a view into the model's mmapped weights).
   std::unordered_map<int32_t, absl::Span<const uint8_t>> buffer_bytes_;
@@ -73,6 +98,10 @@ class WeightBank {
   // (tensors that share storage), which is how shared weights resolve to a
   // single pool buffer.
   std::unordered_map<std::string, int32_t> name_to_buffer_id_;
+  // BufferId -> byte offset in the packed bank, populated by Finalize().
+  std::unordered_map<int32_t, size_t> buffer_offsets_;
+  // Total packed bank size, set by Finalize().
+  size_t bank_size_ = 0;
 };
 
 }  // namespace litert::openvino

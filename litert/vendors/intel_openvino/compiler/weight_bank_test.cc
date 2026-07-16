@@ -14,8 +14,12 @@
 
 #include "litert/vendors/intel_openvino/compiler/weight_bank.h"
 
+#include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <optional>
+#include <string>
+#include <vector>
 
 #include <gtest/gtest.h>
 #include "litert/c/internal/litert_compiler_context.h"
@@ -104,6 +108,128 @@ TEST(WeightBankTest, BufferIdOfNameResolvesWeightTensors) {
   }
   EXPECT_GT(named_weights, 0u);
   EXPECT_EQ(bank.BufferIdOfName("no_such_tensor"), std::nullopt);
+}
+
+// Finalize() packs the single buffer at offset 0 and sets the bank size to its
+// byte size. (Weightless/NPU packed-bank layout.)
+TEST(WeightBankTest, FinalizePacksSingleBufferAtZero) {
+  auto cc_model = testing::LoadTestFileModel("add_cst.tflite");
+  const LiteRtCompilerContext* ctx = LrtGetCompilerContext();
+  litert::compiler::Model model(ctx, cc_model.Get());
+  auto graph = model.Subgraph(0);
+  ASSERT_TRUE(graph.HasValue());
+
+  WeightBank bank;
+  bank.AddSubgraph(graph.Value());
+  bank.Finalize();
+
+  EXPECT_EQ(bank.BankSize(), bank.TotalBytes());
+  EXPECT_EQ(bank.BankSize(), 16u);
+}
+
+// Finalize() lays out multiple buffers contiguously and without overlap: the
+// offsets cover [0, BankSize()) exactly once when walked in offset order.
+TEST(WeightBankTest, FinalizeLaysOutContiguously) {
+  auto cc_model = testing::LoadTestFileModel("multi_subgraph.tflite");
+  const LiteRtCompilerContext* ctx = LrtGetCompilerContext();
+  litert::compiler::Model model(ctx, cc_model.Get());
+  WeightBank bank;
+  for (size_t s = 0; s < model.NumSubgraphs(); ++s) {
+    auto graph = model.Subgraph(s);
+    ASSERT_TRUE(graph.HasValue());
+    bank.AddSubgraph(graph.Value());
+  }
+  bank.Finalize();
+
+  ASSERT_EQ(bank.NumBuffers(), 3u);
+  EXPECT_EQ(bank.BankSize(), bank.TotalBytes());
+  EXPECT_EQ(bank.BankSize(), 48u);
+
+  // Collect the per-buffer offsets and verify they tile [0, BankSize())
+  // exactly once with no gaps or overlap.
+  std::vector<size_t> offsets;
+  for (size_t s = 0; s < model.NumSubgraphs(); ++s) {
+    auto graph = model.Subgraph(s);
+    for (const auto& op : graph.Value().Ops()) {
+      for (const auto& input : op.Inputs()) {
+        if (input.HasWeights()) {
+          offsets.push_back(bank.OffsetOf(input.Weights().BufferId()));
+        }
+      }
+    }
+  }
+  std::sort(offsets.begin(), offsets.end());
+  offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+  ASSERT_EQ(offsets.size(), 3u);
+  EXPECT_EQ(offsets[0], 0u);
+  EXPECT_EQ(offsets[1], 16u);
+  EXPECT_EQ(offsets[2], 32u);
+}
+
+// SerializeBank() returns a blob of size BankSize() with each buffer's bytes
+// copied to its assigned offset.
+TEST(WeightBankTest, SerializeBankPlacesBytesAtOffsets) {
+  auto cc_model = testing::LoadTestFileModel("multi_subgraph.tflite");
+  const LiteRtCompilerContext* ctx = LrtGetCompilerContext();
+  litert::compiler::Model model(ctx, cc_model.Get());
+  WeightBank bank;
+  for (size_t s = 0; s < model.NumSubgraphs(); ++s) {
+    auto graph = model.Subgraph(s);
+    ASSERT_TRUE(graph.HasValue());
+    bank.AddSubgraph(graph.Value());
+  }
+  bank.Finalize();
+
+  const std::string blob = bank.SerializeBank();
+  ASSERT_EQ(blob.size(), bank.BankSize());
+
+  // Each weight buffer's bytes must match the blob region at its offset.
+  for (size_t s = 0; s < model.NumSubgraphs(); ++s) {
+    auto graph = model.Subgraph(s);
+    for (const auto& op : graph.Value().Ops()) {
+      for (const auto& input : op.Inputs()) {
+        if (!input.HasWeights()) {
+          continue;
+        }
+        const auto weights = input.Weights();
+        const auto bytes = weights.Bytes();
+        const size_t offset = bank.OffsetOf(weights.BufferId());
+        ASSERT_LE(offset + bytes.size(), blob.size());
+        EXPECT_EQ(0, std::memcmp(blob.data() + offset, bytes.data(),
+                                 bytes.size()));
+      }
+    }
+  }
+}
+
+// OffsetOfName resolves each weight tensor's name to the same offset as its
+// BufferId, and returns nullopt for names the bank never saw.
+TEST(WeightBankTest, OffsetOfNameResolvesWeightTensors) {
+  auto cc_model = testing::LoadTestFileModel("multi_subgraph.tflite");
+  const LiteRtCompilerContext* ctx = LrtGetCompilerContext();
+  litert::compiler::Model model(ctx, cc_model.Get());
+  WeightBank bank;
+  for (size_t s = 0; s < model.NumSubgraphs(); ++s) {
+    auto graph = model.Subgraph(s);
+    ASSERT_TRUE(graph.HasValue());
+    bank.AddSubgraph(graph.Value());
+  }
+  bank.Finalize();
+
+  for (size_t s = 0; s < model.NumSubgraphs(); ++s) {
+    auto graph = model.Subgraph(s);
+    for (const auto& op : graph.Value().Ops()) {
+      for (const auto& input : op.Inputs()) {
+        if (!input.HasWeights()) {
+          continue;
+        }
+        const auto offset = bank.OffsetOfName(input.Name());
+        ASSERT_TRUE(offset.has_value());
+        EXPECT_EQ(*offset, bank.OffsetOf(input.Weights().BufferId()));
+      }
+    }
+  }
+  EXPECT_EQ(bank.OffsetOfName("no_such_tensor"), std::nullopt);
 }
 
 }  // namespace
