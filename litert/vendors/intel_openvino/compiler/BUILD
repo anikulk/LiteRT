@@ -63,6 +63,18 @@ litert_test(
     ],
 )
 
+# Vendored copy of OpenVINO's dev_api WeightlessCacheAttribute header. The
+# class is OPENVINO_API (symbols live in libopenvino) but the header is not
+# shipped in the public runtime/include, so we vendor it to tag constants for
+# weightless caching / cross-partition weight sharing.
+cc_library(
+    name = "weightless_caching_attributes",
+    hdrs = ["weightless_caching_attributes.hpp"],
+    deps = [
+        "@intel_openvino//:openvino",
+    ],
+)
+
 litert_lib(
     name = "weight_bank",
     srcs = ["weight_bank.cc"],
