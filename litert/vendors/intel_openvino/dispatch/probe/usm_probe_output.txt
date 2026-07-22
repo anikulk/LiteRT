@@ -1,0 +1,9 @@
+Probe: 536870912-byte USM_HOST_BUFFER allocations on a shared GPU context
+  case1 alloc[0] base = 0000029B2C180000
+  case1 alloc[1] base = 0000029B4C180000
+  case1 alloc[2] base = 0000029B00000000
+  case1 alloc[3] base = 0000029B6C180000
+  case2 modelA base = 0000029B8C180000
+  case2 modelB base = 0000029BAC180000
+
+VERDICT: PASS - every USM_HOST allocation is a distinct base pointer (no size-keyed pooling; two models cannot alias).
