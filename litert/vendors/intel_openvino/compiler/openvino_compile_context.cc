@@ -102,6 +102,12 @@ OpenVinoCompileContext::OpenVinoCompileContext() {
         context.sdpa_pad_kv_to_alignment_ = (value == "true");
         continue;
       }
+      if (key == "sdpa_preserve_q_heads") {
+        LITERT_LOG(LITERT_INFO, "Custom config: sdpa_preserve_q_heads = %s",
+                   value.c_str());
+        context.sdpa_preserve_q_heads_ = (value == "true");
+        continue;
+      }
       context.configs_map_[key] = value;
       LITERT_LOG(LITERT_INFO, "Custom config: %s = %s", key.c_str(),
                  value.c_str());
@@ -170,6 +176,7 @@ void OpenVinoCompileContext::OptimizeModel(
         .SetEliminateMatMulFakeQuantize(eliminate_fq_after_matmul_)
         .SetFuseSplitAttentionToSDPA(fuse_split_attention_to_sdpa_)
         .SetSdpaPadKvToAlignment(sdpa_pad_kv_to_alignment_)
+        .SetSdpaPreserveQHeads(sdpa_preserve_q_heads_)
         .Run(model);
   }
 }

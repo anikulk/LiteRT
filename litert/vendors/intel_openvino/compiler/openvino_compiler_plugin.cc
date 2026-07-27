@@ -13,11 +13,14 @@
 // limitations under the License.
 
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <ios>
 #include <limits>
 #include <memory>
 #include <ostream>
+#include <sstream>
 #include <streambuf>
 #include <string>
 #include <string_view>
@@ -29,6 +32,9 @@
 #include "openvino/frontend/tensorflow_lite/frontend.hpp"
 #include "openvino/frontend/tensorflow_lite/graph_iterator.hpp"
 #include "openvino/openvino.hpp"
+#include "openvino/pass/constant_folding.hpp"
+#include "openvino/pass/manager.hpp"
+#include "openvino/pass/serialize.hpp"
 #include "openvino/runtime/core.hpp"
 #include "absl/strings/str_format.h"  // from @com_google_absl
 #include "litert/c/internal/litert_logging.h"
@@ -55,6 +61,79 @@
 namespace {
 
 constexpr char kPluginManufacturer[] = "IntelOpenVINO";
+
+// Debug hook: when the LITERT_OV_DUMP_IR env var is set to a directory, dump the
+// post-OptimizeModel OpenVINO IR for each partition so the graph (e.g. the fused
+// SDPA / head layout) can be inspected. The dump runs BEFORE compile_model and
+// on a clone for the "_cf" variant, so the real compile path is unaffected.
+//
+// Two IRs are emitted per partition:
+//   <dir>/<graph>_raw.xml  -- the model as OptimizeModel left it (still dynamic
+//                             Slice/Select shapes).
+//   <dir>/<graph>_cf.xml   -- a CLONE after ov::pass::ConstantFolding, which
+//                             resolves the dynamic Slice/Select shapes to static.
+// Set LITERT_OV_DUMP_IR_CF_ONLY to skip the (large) "_raw" dump.
+//
+// Serializes via ov::pass::StreamSerialize rather than ov::pass::Serialize:
+// Serialize carries an ov::OpSet member whose weak dtor/allocation binds across
+// the clang-built plugin vs gcc-built libopenvino ABI boundary and throws a
+// spurious std::bad_alloc here. StreamSerialize has no OpSet member; it writes
+// one framed stream [DataHeader][consts/bin][xml] which we split into .xml/.bin.
+void SerializeIrAbiSafe(const std::shared_ptr<ov::Model>& model,
+                        const std::string& base) {
+  std::ostringstream blob_stream(std::ios::binary);
+  ov::pass::StreamSerialize(blob_stream).run_on_model(model);
+  const std::string blob = blob_stream.str();
+
+  ov::pass::StreamSerialize::DataHeader hdr{};
+  if (blob.size() < sizeof(hdr)) {
+    LITERT_LOG(LITERT_WARNING, "SerializeIrAbiSafe: blob too small");
+    return;
+  }
+  std::memcpy(&hdr, blob.data(), sizeof(hdr));
+  // Offsets are absolute from blob start (use_absolute_offset()).
+  const std::string bin = blob.substr(hdr.consts_offset, hdr.consts_size);
+  const std::string xml = blob.substr(hdr.model_offset, hdr.model_size);
+  std::ofstream(base + ".xml", std::ios::binary).write(xml.data(), xml.size());
+  std::ofstream(base + ".bin", std::ios::binary).write(bin.data(), bin.size());
+}
+
+void MaybeDumpIr(const std::shared_ptr<ov::Model>& ov_model,
+                 const std::string& graph_name) {
+  const char* dump_dir = std::getenv("LITERT_OV_DUMP_IR");
+  if (dump_dir == nullptr || dump_dir[0] == '\0') {
+    return;
+  }
+  const std::string base = std::string(dump_dir) + "/" + graph_name;
+  const char* cf_only_env = std::getenv("LITERT_OV_DUMP_IR_CF_ONLY");
+  const bool cf_only = cf_only_env != nullptr && cf_only_env[0] != '\0';
+  try {
+    if (!cf_only) {
+      SerializeIrAbiSafe(ov_model, base + "_raw");
+    }
+    // Clone + ConstantFolding -> static shapes. The FQ elimination and
+    // split-attention->SDPA fusion have ALREADY been applied to |ov_model| by
+    // OptimizeModel before this dump runs; we clone the transformed model and
+    // only ConstantFold it to resolve dynamic Slice/Select shapes.
+    {
+      LITERT_LOG(LITERT_INFO, "DumpCfIR: cloning model...");
+      auto clone = ov_model->clone();
+      LITERT_LOG(LITERT_INFO, "DumpCfIR: clone done; running ConstantFolding...");
+      {
+        ov::pass::Manager cf_mgr("LiteRT:DumpCfFold");
+        cf_mgr.register_pass<ov::pass::ConstantFolding>();
+        cf_mgr.run_passes(clone);
+      }
+      LITERT_LOG(LITERT_INFO, "DumpCfIR: fold done; serializing...");
+      SerializeIrAbiSafe(clone, base + "_cf");
+      LITERT_LOG(LITERT_INFO, "DumpCfIR: serialize done");
+    }
+    LITERT_LOG(LITERT_INFO, "Dumped OpenVINO IR (cf) to %s", base.c_str());
+  } catch (const std::exception& e) {
+    LITERT_LOG(LITERT_WARNING, "LITERT_OV_DUMP_IR: failed to dump IR: %s",
+               e.what());
+  }
+}
 
 constexpr LiteRtOpCode kSupportedOps[] = {
     kLiteRtOpCodeTflConv2d,
@@ -530,6 +609,10 @@ LiteRtStatus LiteRtCompilerPluginCompile(
 
         // Run NPU-specific optimization passes.
         context.OptimizeModel(ov_model);
+
+        // Debug: dump the post-optimization IR when LITERT_OV_DUMP_IR is set.
+        // No-op otherwise; does not affect the compile path below.
+        MaybeDumpIr(ov_model, graph_name);
 
         // Compile using the per-partition device and properties.
         LITERT_LOG(LITERT_INFO, "Compiling partition %d for device %s",

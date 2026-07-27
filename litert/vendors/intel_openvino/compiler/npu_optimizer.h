@@ -80,7 +80,20 @@ class FuseSplitAttentionToSDPA : public ov::pass::MatcherPass {
   // false, such blocks are left unfused. When true(default), the merged K/V
   // is padded up to the next multiple of 16 and the mask is padded with a
   // large negative bias so the padded key positions are excluded from softmax.
-  explicit FuseSplitAttentionToSDPA(bool pad_kv_to_alignment);
+  //
+  // |preserve_q_heads| controls the Q layout fed to the fused SDPA. Gemma-style
+  // exports fold the query heads into the sequence axis before the QK MatMul
+  // (Reshape [1,H,S,D] -> [1,1,H*S,D]) so that a single-KV-head cache can be
+  // matmul'd without an explicit broadcast; the mask is correspondingly tiled
+  // H-fold along the query axis (Concat/Tile [1,1,S,X] -> [1,1,H*S,X]). When
+  // false (default) the fused SDPA inherits this flattened Q [1,1,H*S,D]. When
+  // true, the pass instead feeds SDPA the pre-fold Q [1,H,S,D] and the pre-tile
+  // per-query mask [1,1,S,X], relying on v13::SDPA's built-in GQA broadcast over
+  // the single-head K/V. This yields a head-preserved SDPA whose output is
+  // [1,H,S,D]; the downstream Reshape (fixed [1,H,S,D] target) absorbs it as a
+  // no-op. Only applied when Q's producer is exactly such a head-fold Reshape.
+  explicit FuseSplitAttentionToSDPA(bool pad_kv_to_alignment,
+                                    bool preserve_q_heads);
 };
 
 // Configurable runner for NPU-specific optimization passes.
@@ -116,6 +129,15 @@ class NpuOptimizer {
     return *this;
   }
 
+  // Controls whether the SDPA fusion preserves the query head dimension
+  // ([1,H,S,D]) instead of inheriting the model's head-into-sequence fold
+  // ([1,1,H*S,D]). Disabled by default; enable via config key
+  // "sdpa_preserve_q_heads" = "true". See FuseSplitAttentionToSDPA.
+  NpuOptimizer& SetSdpaPreserveQHeads(bool enable) {
+    sdpa_preserve_q_heads_ = enable;
+    return *this;
+  }
+
   // Runs all currently-enabled passes on |model|.
   void Run(const std::shared_ptr<ov::Model>& model) const;
 
@@ -124,6 +146,7 @@ class NpuOptimizer {
   bool cast_integer_sign_to_float_ = true;
   bool fuse_split_attention_to_sdpa_ = false;
   bool sdpa_pad_kv_to_alignment_ = true;
+  bool sdpa_preserve_q_heads_ = false;
 };
 
 }  // namespace openvino

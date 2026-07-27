@@ -69,6 +69,11 @@ class OpenVinoCompileContext {
   // whether the `FuseSplitAttentionToSDPA` pass pads KV sequences up to the NPU
   // SDPA kernel's required alignment when fusing.
   bool sdpa_pad_kv_to_alignment_ = true;
+  // `sdpa_preserve_q_heads_` is only meaningful when
+  // `fuse_split_attention_to_sdpa_` is true. Disabled by default. It controls
+  // whether the fused SDPA keeps the query head dimension ([1,H,S,D]) rather
+  // than inheriting the model's head-into-sequence fold ([1,1,H*S,D]).
+  bool sdpa_preserve_q_heads_ = false;
 };
 
 }  // namespace openvino

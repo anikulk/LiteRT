@@ -35,6 +35,7 @@
 #include "openvino/op/fake_quantize.hpp"
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/pad.hpp"
+#include "openvino/op/reshape.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/sign.hpp"
 #include "openvino/op/slice.hpp"
@@ -89,6 +90,139 @@ ov::Output<ov::Node> PadEndOfAxis(const ov::Output<ov::Node>& input,
   return std::make_shared<ov::op::v1::Pad>(input, pads_begin, pads_end, value,
                                            ov::op::PadMode::CONSTANT)
       ->output(0);
+}
+
+// Detects the Gemma "head-into-sequence" query fold together with its matching
+// mask tiling, and — when both are present, consistent, and safe — rewrites
+// |q| and |mask| in place to feed the fused SDPA the pre-fold, head-preserved
+// query and per-query mask. Returns true when a rewrite was applied.
+//
+// The exports fold query heads into the sequence axis before the QK MatMul so a
+// single-KV-head cache can be matmul'd without an explicit broadcast:
+//
+//   q_folded  = Reshape(q, [1, G, F*S, D])   // from q [1, H, S, D], F = H/G
+//   mask_tile = Concat([base, base, ... F copies ...], axis=2)  // base [1,1,S,X]
+//
+// Feeding SDPA the pre-fold q [1, H, S, D] and per-query base mask [1, 1, S, X]
+// relies on SDPA's built-in broadcast over the head axis. This is only provably
+// correct for plain (numpy) broadcasting, i.e. when the KV head count G == 1
+// (multi-query attention): then the query head axis (H) broadcasts against a
+// single KV head. Grouped-query folds (G > 1) would require true grouped-query
+// broadcast semantics and are intentionally left folded here (still handled by
+// the folded fusion path). See FuseSplitAttentionToSDPA in the header.
+bool TryPreserveQueryHeads(ov::Output<ov::Node>& q, ov::Output<ov::Node>& mask,
+                           const std::string& root_name) {
+  // Helper: log the concrete reason this layer was not head-preserved (it
+  // falls back to the folded fusion, which is still correct) and return false.
+  auto reject = [&](const char* why) -> bool {
+    LITERT_LOG(LITERT_DEBUG,
+               "FuseSplitAttentionToSDPA[%s]: preserve_q_heads not applied: %s "
+               "(q='%s' [%s], mask='%s' [%s])",
+               root_name.c_str(), why,
+               q.get_node_shared_ptr()->get_type_name(),
+               q.get_partial_shape().to_string().c_str(),
+               mask.get_node_shared_ptr()->get_type_name(),
+               mask.get_partial_shape().to_string().c_str());
+    return false;
+  };
+
+  // ---- Query side: q is the folded query, a static [1, 1, H*S, D] tensor.
+  // Only the folded OUTPUT shape is inspected (never the pre-fold producer's
+  // input): this pass runs before ConstantFolding, so the head-fold Reshape's
+  // input is still dynamically shaped and its head/seq split is not yet
+  // recoverable from it. H and S are instead derived from the mask tiling
+  // below, which is what makes the fold invertible here.
+  const auto q_ps = q.get_partial_shape();
+  if (q_ps.rank().is_dynamic() || q_ps.rank().get_length() != 4) {
+    return reject("folded Q is not 4D");
+  }
+  if (q_ps[0].is_dynamic() || q_ps[1].is_dynamic() || q_ps[2].is_dynamic() ||
+      q_ps[3].is_dynamic()) {
+    return reject("folded Q has dynamic dims");
+  }
+  const int64_t q_batch = q_ps[0].get_length();
+  const int64_t q_groups = q_ps[1].get_length();      // G (== KV head count)
+  const int64_t q_folded_seq = q_ps[2].get_length();  // H*S
+  const int64_t head_dim = q_ps[3].get_length();       // D
+  // Only multi-query folds ([1,1,H*S,D]) are provably broadcast-safe: the query
+  // head axis then broadcasts (plain numpy) against a single KV head. Grouped
+  // folds ([1,G,...] with G>1) need true grouped-query semantics and are left
+  // folded for the standard fusion path.
+  if (q_batch != 1 || q_groups != 1) {
+    return reject("folded Q is not [1,1,H*S,D] (MQA)");
+  }
+  // The producer must be the head-fold Reshape (confirms this [1,1,H*S,D] is a
+  // query fold rather than some other tensor of the same shape).
+  if (!ov::is_type<ov::op::v1::Reshape>(q.get_node_shared_ptr())) {
+    return reject("Q producer is not a Reshape (head fold)");
+  }
+
+  // ---- Mask side: expect Concat(axis=2) of H identical copies of one
+  // per-query base mask [1, 1, S, X]. The number of copies IS the query head
+  // count H and the base query dim is S; together they recover the fold split,
+  // and must satisfy H*S == folded query length.
+  auto concat =
+      std::dynamic_pointer_cast<ov::op::v0::Concat>(mask.get_node_shared_ptr());
+  if (!concat) {
+    return reject("mask producer is not a Concat");
+  }
+  const auto crank = concat->get_output_partial_shape(0).rank();
+  if (crank.is_dynamic() || crank.get_length() != 4) {
+    return reject("mask Concat is not 4D");
+  }
+  int64_t caxis = concat->get_axis();
+  if (caxis < 0) caxis += crank.get_length();
+  if (caxis != 2) {
+    return reject("mask Concat axis is not the query axis (2)");
+  }
+  const ov::Output<ov::Node> base = concat->input_value(0);
+  for (size_t i = 1; i < concat->get_input_size(); ++i) {
+    if (concat->input_value(i) != base) {
+      return reject("mask Concat inputs are not all identical");
+    }
+  }
+  const auto& base_ps = base.get_partial_shape();
+  if (base_ps.rank().is_dynamic() || base_ps.rank().get_length() != 4 ||
+      base_ps[2].is_dynamic()) {
+    return reject("mask base is not 4D with static query dim");
+  }
+  const int64_t heads = static_cast<int64_t>(concat->get_input_size());  // H
+  const int64_t seq = base_ps[2].get_length();                          // S
+  if (heads <= 1 || seq <= 0 || heads * seq != q_folded_seq) {
+    LITERT_LOG(LITERT_DEBUG,
+               "FuseSplitAttentionToSDPA[%s]: preserve_q_heads not applied: "
+               "mask tiling H*S (%lld*%lld) != folded Q seq %lld",
+               root_name.c_str(), static_cast<long long>(heads),
+               static_cast<long long>(seq),
+               static_cast<long long>(q_folded_seq));
+    return false;
+  }
+
+  // ---- Rewrite. Unfold the folded query [1,1,H*S,D] back to the head-
+  // preserved [1,H,S,D] via an explicit Reshape (the row-major inverse of the
+  // fold; static target, so ConstantFolding-safe), and feed SDPA the per-query
+  // base mask [1,1,S,X]. v13::SDPA then broadcasts the single KV head over the
+  // H query heads and broadcasts the base mask over the head axis, producing a
+  // result numerically identical to the folded computation (verified in
+  // npu_optimizer_test). The head-preserved SDPA output is [1,H,S,D]; the
+  // model's downstream Reshape (fixed [1,H,S,D] target) absorbs it as a no-op.
+  auto unfold_shape = ov::op::v0::Constant::create(
+      ov::element::i64, ov::Shape{4}, {int64_t{1}, heads, seq, head_dim});
+  auto q_unfold = std::make_shared<ov::op::v1::Reshape>(
+      q, unfold_shape, /*special_zero=*/false);
+  q_unfold->set_friendly_name(q.get_node_shared_ptr()->get_friendly_name() +
+                              "/preserve_q_heads_unfold");
+  q = q_unfold->output(0);
+  mask = base;
+  LITERT_LOG(LITERT_DEBUG,
+             "FuseSplitAttentionToSDPA[%s]: preserving query heads "
+             "(H=%lld, S=%lld, D=%lld); Q -> [1,%lld,%lld,%lld], "
+             "mask -> per-query base [1,1,%lld,X]",
+             root_name.c_str(), static_cast<long long>(heads),
+             static_cast<long long>(seq), static_cast<long long>(head_dim),
+             static_cast<long long>(heads), static_cast<long long>(seq),
+             static_cast<long long>(head_dim), static_cast<long long>(seq));
+  return true;
 }
 
 }  // namespace
@@ -153,7 +287,8 @@ CastIntegerSignToFloat::CastIntegerSignToFloat() {
   register_matcher(m, callback);
 }
 
-FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
+FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment,
+                                                   bool preserve_q_heads) {
   namespace pattern = ov::pass::pattern;
 
   auto q_input = pattern::any_input();
@@ -300,6 +435,17 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
     auto v_cache = v_matmul_cache->input_value(1);
     auto v_new = v_matmul_new->input_value(1);
     auto mask_value = mask_add_node->input_value(1);
+
+    // Optionally undo the head-into-sequence query fold so the fused SDPA keeps
+    // the query head dimension ([1,H,S,D]) and consumes the per-query mask,
+    // relying on SDPA's head-axis broadcast over the single-head K/V. No-op
+    // (leaves q/mask_value folded) when the pattern does not match or the flag
+    // is off. Must run before the static-rank check below so it validates the
+    // rewritten (pre-fold) query. Both q and mask_value are rewritten together
+    // or not at all, keeping their head/query axes consistent for SDPA.
+    if (preserve_q_heads) {
+      TryPreserveQueryHeads(q, mask_value, root_name);
+    }
 
     // KV-cache sharing guard: K_cache / V_cache must each feed exactly one
     // consumer (the QK / attn*V MatMul we are about to fuse). If the same KV
@@ -462,7 +608,7 @@ void NpuOptimizer::Run(const std::shared_ptr<ov::Model>& model) const {
   }
   if (fuse_split_attention_to_sdpa_) {
     pass_manager.register_pass<FuseSplitAttentionToSDPA>(
-        sdpa_pad_kv_to_alignment_);
+        sdpa_pad_kv_to_alignment_, sdpa_preserve_q_heads_);
   }
   if (eliminate_matmul_fq_) {
     pass_manager.register_pass<EliminateMatMulFakeQuantize>();

@@ -28,6 +28,7 @@
 #include "openvino/op/constant.hpp"
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/parameter.hpp"
+#include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
 #include "openvino/op/scaled_dot_product_attention.hpp"
 #include "openvino/op/slice.hpp"
@@ -119,6 +120,91 @@ std::shared_ptr<ov::Model> BuildSplitCacheAttention(int64_t s_past = 8,
       ov::ResultVector{result},
       ov::ParameterVector{q, k_cache, k_slice, v_cache, v_slice, mask},
       "split_cache_attention");
+}
+
+// Builds the "head-folded" split-cache pattern emitted for Gemma global
+// (multi-query) layers: the query heads are folded into the sequence axis
+// before the QK MatMul so a single-KV-head cache can be matmul'd without an
+// explicit broadcast, and the per-query mask is tiled H-fold to match:
+//
+//   q_folded  = Reshape(Q[1,H,S,D] -> [1,1,H*S,D])
+//   K_cache: [1,1,s_past,D]   K_slice: [1,1,S,D]      (single KV head)
+//   V_cache: [1,1,D,s_past]   V_slice: [1,1,D,S]      (transposed, adj_y=true)
+//   mask    = Concat([base[1,1,S,s_kv]] * H, axis=2)  -> [1,1,H*S,s_kv]
+//   scores  = Concat[ MatMul(q_folded,K_cache,T), MatMul(q_folded,K_slice,T) ]
+//   probs   = Softmax(scores + mask)
+//   out     = Add[ MatMul(Slice(probs,past),V_cache,T),
+//                  MatMul(Slice(probs,cur), V_slice,T) ]   -> [1,1,H*S,D]
+//
+// The folded output [1,1,H*S,D] is, element for element, the head-major
+// flattening of a [1,H,S,D] tensor, so it can be compared directly against the
+// head-preserved SDPA output.
+std::shared_ptr<ov::Model> BuildFoldedMqaAttention(int64_t heads, int64_t s_cur,
+                                                   int64_t s_past,
+                                                   int64_t dim) {
+  using ov::op::v0::Concat;
+  using ov::op::v0::Constant;
+  using ov::op::v0::MatMul;
+  using ov::op::v0::Parameter;
+  using ov::op::v1::Add;
+  using ov::op::v1::Reshape;
+  using ov::op::v8::Slice;
+  using ov::op::v8::Softmax;
+
+  const int64_t s_kv = s_past + s_cur;
+  const int64_t folded_q = heads * s_cur;
+  const auto f = ov::element::f32;
+  auto S = [](int64_t v) { return static_cast<size_t>(v); };
+
+  auto q = std::make_shared<Parameter>(
+      f, ov::Shape{1, S(heads), S(s_cur), S(dim)});
+  auto q_shape = Constant::create<int64_t>(ov::element::i64, ov::Shape{4},
+                                           {1, 1, folded_q, dim});
+  auto q_folded = std::make_shared<Reshape>(q, q_shape, /*special_zero=*/false);
+
+  auto k_cache =
+      std::make_shared<Parameter>(f, ov::Shape{1, 1, S(s_past), S(dim)});
+  auto k_slice =
+      std::make_shared<Parameter>(f, ov::Shape{1, 1, S(s_cur), S(dim)});
+  auto v_cache =
+      std::make_shared<Parameter>(f, ov::Shape{1, 1, S(dim), S(s_past)});
+  auto v_slice =
+      std::make_shared<Parameter>(f, ov::Shape{1, 1, S(dim), S(s_cur)});
+  auto mask_base =
+      std::make_shared<Parameter>(f, ov::Shape{1, 1, S(s_cur), S(s_kv)});
+
+  // Tile the per-query mask H-fold along the query axis (axis=2).
+  ov::OutputVector mask_copies(static_cast<size_t>(heads), mask_base);
+  auto mask = std::make_shared<Concat>(mask_copies, /*axis=*/2);
+
+  auto qk_cache = std::make_shared<MatMul>(q_folded, k_cache,
+                                           /*transpose_a=*/false,
+                                           /*transpose_b=*/true);
+  auto qk_slice = std::make_shared<MatMul>(q_folded, k_slice, false, true);
+  auto scores = std::make_shared<Concat>(ov::OutputVector{qk_cache, qk_slice},
+                                         /*axis=*/-1);
+  auto masked = std::make_shared<Add>(scores, mask);
+  auto probs = std::make_shared<Softmax>(masked, /*axis=*/-1);
+
+  auto start0 = Constant::create(ov::element::i64, ov::Shape{1}, {0});
+  auto stop0 = Constant::create(ov::element::i64, ov::Shape{1}, {s_past});
+  auto step = Constant::create(ov::element::i64, ov::Shape{1}, {1});
+  auto axis = Constant::create(ov::element::i64, ov::Shape{1}, {-1});
+  auto slice_past = std::make_shared<Slice>(probs, start0, stop0, step, axis);
+
+  auto start1 = Constant::create(ov::element::i64, ov::Shape{1}, {s_past});
+  auto stop1 = Constant::create(ov::element::i64, ov::Shape{1}, {s_kv});
+  auto slice_cur = std::make_shared<Slice>(probs, start1, stop1, step, axis);
+
+  auto pv_cache = std::make_shared<MatMul>(slice_past, v_cache, false, true);
+  auto pv_slice = std::make_shared<MatMul>(slice_cur, v_slice, false, true);
+  auto out = std::make_shared<Add>(pv_cache, pv_slice);
+
+  auto result = std::make_shared<ov::op::v0::Result>(out);
+  return std::make_shared<ov::Model>(
+      ov::ResultVector{result},
+      ov::ParameterVector{q, k_cache, k_slice, v_cache, v_slice, mask_base},
+      "folded_mqa_attention");
 }
 
 template <typename T>
@@ -248,6 +334,103 @@ TEST(FuseSplitAttentionToSDPATest, NumericallyMatchesSplitCache) {
   }
   EXPECT_LT(max_abs_diff, 1e-4f)
       << "fused output diverges from split-cache reference";
+}
+
+// With preserve_q_heads enabled, fusing the head-folded MQA pattern must undo
+// the query fold: the resulting SDPA keeps the query head dimension
+// ([1,H,S,D]) and consumes the pre-fold query and per-query (un-tiled) mask.
+TEST(FuseSplitAttentionToSDPATest, PreserveQHeadsKeepsHeadDim) {
+  constexpr int64_t kHeads = 16;
+  constexpr int64_t kSeq = 8;
+  constexpr int64_t kPast = 8;
+  constexpr int64_t kDim = 32;
+  auto model = BuildFoldedMqaAttention(kHeads, kSeq, kPast, kDim);
+
+  // Sanity: the fold Reshape and the H-fold mask Concat are present up front.
+  EXPECT_EQ(CountOps<ov::op::v1::Reshape>(model), 1u);
+  EXPECT_EQ(CountOps<ov::op::v0::Concat>(model), 2u);  // mask tile + scores
+
+  NpuOptimizer()
+      .SetCastIntegerSignToFloat(false)
+      .SetFuseSplitAttentionToSDPA(true)
+      .SetSdpaPreserveQHeads(true)
+      .Run(model);
+
+  auto sdpa = FindSdpa(model);
+  ASSERT_NE(sdpa, nullptr) << "fusion did not fire";
+
+  // Query fed to SDPA is the pre-fold [1, H, S, D].
+  const auto q_ps = sdpa->get_input_partial_shape(0);
+  ASSERT_TRUE(q_ps.rank().is_static() && q_ps.rank().get_length() == 4);
+  EXPECT_EQ(q_ps[1].get_length(), kHeads);
+  EXPECT_EQ(q_ps[2].get_length(), kSeq);
+  EXPECT_EQ(q_ps[3].get_length(), kDim);
+
+  // SDPA output is head-preserved [1, H, S, D].
+  const auto out_ps = sdpa->get_output_partial_shape(0);
+  ASSERT_TRUE(out_ps.rank().is_static() && out_ps.rank().get_length() == 4);
+  EXPECT_EQ(out_ps[1].get_length(), kHeads);
+  EXPECT_EQ(out_ps[2].get_length(), kSeq);
+  EXPECT_EQ(out_ps[3].get_length(), kDim);
+
+  // The head-fold Reshape and the mask-tile Concat were bypassed: only the
+  // K/V concats built by the fusion remain (2), the mask tile is gone.
+  EXPECT_EQ(CountOps<ov::op::v13::ScaledDotProductAttention>(model), 1u);
+  EXPECT_EQ(CountOps<ov::op::v8::Softmax>(model), 0u);
+  EXPECT_EQ(CountOps<ov::op::v0::MatMul>(model), 0u);
+}
+
+// Numerical check: the head-preserved SDPA must reproduce the folded reference
+// output exactly. The folded output [1,1,H*S,D] is the head-major flattening of
+// [1,H,S,D], so the two output buffers compare element-for-element in order.
+TEST(FuseSplitAttentionToSDPATest, PreserveQHeadsNumericallyMatchesFolded) {
+  constexpr int64_t kHeads = 16;
+  constexpr int64_t kSeq = 8;
+  constexpr int64_t kPast = 8;
+  constexpr int64_t kDim = 32;
+  auto reference = BuildFoldedMqaAttention(kHeads, kSeq, kPast, kDim);
+  auto fused = reference->clone();
+
+  NpuOptimizer()
+      .SetCastIntegerSignToFloat(false)
+      .SetFuseSplitAttentionToSDPA(true)
+      .SetSdpaPreserveQHeads(true)
+      .Run(fused);
+  ASSERT_NE(FindSdpa(fused), nullptr) << "fusion did not fire";
+
+  ov::Core core;
+  auto ref_compiled = core.compile_model(reference, "CPU");
+  auto fused_compiled = core.compile_model(fused, "CPU");
+  auto ref_req = ref_compiled.create_infer_request();
+  auto fused_req = fused_compiled.create_infer_request();
+
+  // Inputs ordered as constructed: {q, k_cache, k_slice, v_cache, v_slice,
+  // mask_base}. Both graphs share the same parameter set.
+  const size_t num_inputs = reference->inputs().size();
+  ASSERT_EQ(num_inputs, fused->inputs().size());
+  for (size_t i = 0; i < num_inputs; ++i) {
+    const auto& port = reference->input(i);
+    ov::Tensor t(port.get_element_type(), port.get_shape());
+    FillRandom(t, static_cast<uint32_t>(i + 1));
+    ref_req.set_input_tensor(i, t);
+    fused_req.set_input_tensor(i, t);
+  }
+
+  ref_req.infer();
+  fused_req.infer();
+
+  auto ref_out = ref_req.get_output_tensor(0);   // [1,1,H*S,D]
+  auto fused_out = fused_req.get_output_tensor(0);  // [1,H,S,D]
+  ASSERT_EQ(ref_out.get_size(), fused_out.get_size());
+  const auto* a = ref_out.data<float>();
+  const auto* b = fused_out.data<float>();
+  float max_abs_diff = 0.0f;
+  for (size_t i = 0; i < ref_out.get_size(); ++i) {
+    max_abs_diff = std::max(max_abs_diff, std::abs(a[i] - b[i]));
+    ASSERT_FALSE(std::isnan(b[i])) << "fused output has NaN at " << i;
+  }
+  EXPECT_LT(max_abs_diff, 1e-4f)
+      << "head-preserved SDPA diverges from folded reference";
 }
 
 }  // namespace
