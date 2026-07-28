@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//litert/build_common:litert_build_defs.bzl", "litert_bin", "litert_dynamic_lib", "litert_lib")
@@ -250,5 +251,27 @@ sh_test(
     ],
     data = [
         ":dispatch_api_so",
+    ],
+)
+
+# Hardware-dependent manual check for the split-context KV strided-ROI design:
+# binds a strided ROI sub-view of a larger parent tensor to a static-shape
+# compiled port and verifies the device plugin reads/writes it correctly.
+# Not a unit test (exercises a real OpenVINO device); run explicitly:
+#   bazel run //litert/vendors/intel_openvino/dispatch:roi_view_manual_test -- NPU
+cc_binary(
+    name = "roi_view_manual_test",
+    testonly = True,
+    srcs = ["roi_view_manual_test.cc"],
+    copts = ["-fexceptions"],
+    features = ["-use_header_modules"],  # Incompatible with -fexceptions.
+    tags = [
+        "manual",
+        "no-remote-exec",
+        "no_oss",
+        "notap",
+    ],
+    deps = [
+        "@intel_openvino//:openvino",
     ],
 )
