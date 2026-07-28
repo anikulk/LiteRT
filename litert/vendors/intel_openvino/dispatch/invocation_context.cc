@@ -27,6 +27,8 @@
 #include <vector>
 
 #include "openvino/core/any.hpp"
+#include "openvino/core/coordinate.hpp"
+#include "openvino/core/shape.hpp"
 #include "openvino/runtime/compiled_model.hpp"
 #include "openvino/runtime/tensor.hpp"
 #include "litert/c/internal/litert_logging.h"
@@ -124,6 +126,47 @@ class SharedStreamBuffer : public std::streambuf {
   const size_t size_;
   size_t offset_;
 };
+
+// Returns a view of `buffer_tensor` matching `port_shape`. When the shapes are
+// identical the tensor is bound as-is. When the buffer is LARGER than the port
+// (the split-context KV-cache case: one canonical max-length buffer, e.g. seq
+// 16383, shared by a shorter signature port, e.g. prefill seq 16256), a
+// zero-copy region-of-interest sub-view is created that starts at offset 0 on
+// every dimension and extends to the port's extent. Because every signature
+// slices from offset 0, absolute cache position `p` maps to the same physical
+// address in every view, so writes from one signature are visible to another
+// with no copy. The ROI inherits the parent's strides, which is exactly what
+// the NPU/GPU plugin needs for strided access, and it is layout-agnostic: it
+// handles both the K layout ([1,H,S,D], seq at dim 2) and the transposed-V
+// layout ([1,H,D,S], seq at dim 3) uniformly, since only the differing
+// dimension is trimmed.
+litert::Expected<ov::Tensor> MakePortView(const ov::Tensor& buffer_tensor,
+                                          const ov::Shape& port_shape) {
+  const ov::Shape& buffer_shape = buffer_tensor.get_shape();
+  if (buffer_shape == port_shape) {
+    return buffer_tensor;
+  }
+  if (buffer_shape.size() != port_shape.size()) {
+    return litert::Error(
+        kLiteRtStatusErrorRuntimeFailure,
+        "KV buffer rank does not match graph port rank; cannot create view");
+  }
+  // The buffer must be at least as large as the port on every dimension, and
+  // the buffer's element type/layout must match the port on every dimension
+  // except the (single) cache-length dimension being trimmed.
+  for (size_t i = 0; i < buffer_shape.size(); ++i) {
+    if (buffer_shape[i] < port_shape[i]) {
+      return litert::Error(
+          kLiteRtStatusErrorRuntimeFailure,
+          "KV buffer smaller than graph port; cannot create view");
+    }
+  }
+  ov::Coordinate begin(buffer_shape.size(), 0);
+  ov::Coordinate end(port_shape.begin(), port_shape.end());
+  // ov::Tensor(other, begin, end) is the ROI constructor: a zero-copy sub-view
+  // sharing the parent's memory and strides.
+  return ov::Tensor(buffer_tensor, begin, end);
+}
 
 }  // namespace
 
@@ -275,7 +318,14 @@ litert::Expected<void> LiteRtDispatchInvocationContextT::AttachInput(
                           device_context_.getOVTensor(tensor_buffer_handle));
   // TODO: visit this if need to maintain graph indices for inputs and outputs
   // in dispatch_api
-  infer_request_.set_input_tensor(graph_input_index, ov_tensor);
+  // The bound buffer may be larger than the graph port (split-context KV
+  // cache: one max-length buffer shared by a shorter signature). Bind a
+  // zero-copy sub-view sized to the port when that is the case.
+  const ov::Shape port_shape =
+      infer_request_.get_input_tensor(graph_input_index).get_shape();
+  LITERT_ASSIGN_OR_RETURN(ov::Tensor bound_tensor,
+                          MakePortView(ov_tensor, port_shape));
+  infer_request_.set_input_tensor(graph_input_index, bound_tensor);
   return {};
 }
 
@@ -285,7 +335,11 @@ litert::Expected<void> LiteRtDispatchInvocationContextT::AttachOutput(
                           device_context_.getOVTensor(tensor_buffer_handle));
   // TODO: visit this if need to maintain graph indices for inputs and outputs
   // in dispatch_api
-  infer_request_.set_output_tensor(graph_output_index, ov_tensor);
+  const ov::Shape port_shape =
+      infer_request_.get_output_tensor(graph_output_index).get_shape();
+  LITERT_ASSIGN_OR_RETURN(ov::Tensor bound_tensor,
+                          MakePortView(ov_tensor, port_shape));
+  infer_request_.set_output_tensor(graph_output_index, bound_tensor);
   return {};
 }
 
