@@ -33,6 +33,7 @@
 #include "litert/c/internal/litert_scheduling_info.h"
 #include "litert/c/litert_common.h"
 #include "litert/c/litert_layout.h"
+#include "litert/c/litert_tensor_buffer_types.h"
 #include "litert/cc/litert_buffer_ref.h"
 #include "litert/cc/litert_expected.h"
 #include "litert/cc/litert_macros.h"
@@ -596,5 +597,13 @@ class LiteRtCompiledModelT {
   // Owns dynamically created TfLiteRegistration objects for TfLiteOperator.
   std::vector<std::unique_ptr<TfLiteRegistration>> owned_tflite_registrations_;
 };
+
+// True when a registered input buffer larger than its graph port should be
+// bound as-is (a backend sub-view) rather than auto-resized or rejected: a user
+// custom buffer, static port, that differs from and fully contains the port.
+// The split-context KV cache case; at namespace scope so it can be unit-tested.
+bool ShouldBindOversizedCustomBuffer(LiteRtTensorBufferType buffer_type,
+                                     absl::Span<const int> buffer_shape,
+                                     absl::Span<const int> port_shape);
 
 #endif  // ODML_LITERT_LITERT_RUNTIME_COMPILED_MODEL_H_
