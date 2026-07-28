@@ -1496,6 +1496,28 @@ tflite::SignatureRunner* LiteRtCompiledModelT::GetSignatureRunner(
   return runner;
 }
 
+namespace {
+
+// Returns true when `buffer_shape` has the same rank as `port_shape` and is
+// greater-or-equal on every dimension (i.e. the buffer fully contains the
+// port). Used to recognize a backend custom buffer that is intentionally
+// larger than a static graph port and will be bound as a sub-view by the
+// backend.
+bool ShapeContains(absl::Span<const int> buffer_shape,
+                   absl::Span<const int> port_shape) {
+  if (buffer_shape.size() != port_shape.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < buffer_shape.size(); ++i) {
+    if (buffer_shape[i] < port_shape[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 Expected<void> LiteRtCompiledModelT::RegisterBuffer(
     tflite::SignatureRunner* runner, TfLiteTensor* tensor, int tensor_index,
     const char* tensor_name, LiteRtTensorBufferT* buffer, bool is_input,
@@ -1523,39 +1545,62 @@ Expected<void> LiteRtCompiledModelT::RegisterBuffer(
     absl::Span<const int> buffer_shape =
         absl::MakeConstSpan(layout.dimensions, layout.rank);
 
-    LITERT_ASSIGN_OR_RETURN(bool needs_auto_resize,
-                            InputTensorNeedsResize(tensor, buffer_shape));
-    if (needs_auto_resize) {
-      // When an input tensor is resized, output and intermediate tensors may
-      // also be resized. This can invalidate previously cached buffer
-      // requirements, so we clear the cache.
-      cpu_buffer_requirements_.clear();
-      // Shape change detected - perform automatic resize.
-      TfLiteStatus resize_status = kTfLiteOk;
-      if (runner) {
-        resize_status = runner->ResizeInputTensor(
-            tensor_name,
-            std::vector<int>(buffer_shape.begin(), buffer_shape.end()));
-      } else {
-        resize_status = interp_->ResizeInputTensor(
-            tensor_index,
-            std::vector<int>(buffer_shape.begin(), buffer_shape.end()));
-      }
-      if (resize_status == kTfLiteOk) {
-        LITERT_RETURN_IF_ERROR(MarkSignatureNeedsAllocation(runner));
-        LITERT_LOG(LITERT_INFO, "Automatically resized input tensor index %d",
-                   tensor_index);
-      } else {
-        LITERT_LOG(LITERT_WARNING,
-                   "Automatic resize failed for tensor index %d", tensor_index);
-      }
+    // Split-context KV cache: a backend custom buffer may be intentionally
+    // larger than a static graph port (one canonical max-length KV buffer is
+    // shared across signatures with different past-KV lengths). In that case
+    // the tensor is neither resized to the buffer nor required to match it;
+    // instead the backend binds a zero-copy sub-view sized to the port. Skip
+    // both the auto-resize and the equality check and let the buffer flow to
+    // the backend registration below. This only applies to user custom buffers
+    // (which provide their own binding) and only when the buffer fully contains
+    // the port on every dimension.
+    absl::Span<const int> port_shape =
+        absl::MakeConstSpan(tensor->dims->data, tensor->dims->size);
+    const bool bind_oversized_custom_buffer =
+        IsUserCustomBuffer(buffer->buffer_type()) &&
+        buffer_shape != port_shape && ShapeContains(buffer_shape, port_shape);
+
+    if (bind_oversized_custom_buffer) {
+      LITERT_LOG(LITERT_INFO,
+                 "Binding oversized custom buffer to input tensor index %d as "
+                 "a backend sub-view (buffer rank %zu)",
+                 tensor_index, buffer_shape.size());
     } else {
-      // Get current tensor shape.
-      absl::Span<const int> current_shape =
-          absl::MakeConstSpan(tensor->dims->data, tensor->dims->size);
-      LITERT_RETURN_IF_ERROR(current_shape == buffer_shape,
-                             Unexpected(kLiteRtStatusErrorInvalidArgument,
-                                        "Input tensor shape mismatch"));
+      LITERT_ASSIGN_OR_RETURN(bool needs_auto_resize,
+                              InputTensorNeedsResize(tensor, buffer_shape));
+      if (needs_auto_resize) {
+        // When an input tensor is resized, output and intermediate tensors may
+        // also be resized. This can invalidate previously cached buffer
+        // requirements, so we clear the cache.
+        cpu_buffer_requirements_.clear();
+        // Shape change detected - perform automatic resize.
+        TfLiteStatus resize_status = kTfLiteOk;
+        if (runner) {
+          resize_status = runner->ResizeInputTensor(
+              tensor_name,
+              std::vector<int>(buffer_shape.begin(), buffer_shape.end()));
+        } else {
+          resize_status = interp_->ResizeInputTensor(
+              tensor_index,
+              std::vector<int>(buffer_shape.begin(), buffer_shape.end()));
+        }
+        if (resize_status == kTfLiteOk) {
+          LITERT_RETURN_IF_ERROR(MarkSignatureNeedsAllocation(runner));
+          LITERT_LOG(LITERT_INFO, "Automatically resized input tensor index %d",
+                     tensor_index);
+        } else {
+          LITERT_LOG(LITERT_WARNING,
+                     "Automatic resize failed for tensor index %d",
+                     tensor_index);
+        }
+      } else {
+        // Get current tensor shape.
+        absl::Span<const int> current_shape =
+            absl::MakeConstSpan(tensor->dims->data, tensor->dims->size);
+        LITERT_RETURN_IF_ERROR(current_shape == buffer_shape,
+                               Unexpected(kLiteRtStatusErrorInvalidArgument,
+                                          "Input tensor shape mismatch"));
+      }
     }
   }
 
