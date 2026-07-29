@@ -165,7 +165,39 @@ litert::Expected<ov::Tensor> MakePortView(const ov::Tensor& buffer_tensor,
   ov::Coordinate end(port_shape.begin(), port_shape.end());
   // ov::Tensor(other, begin, end) is the ROI constructor: a zero-copy sub-view
   // sharing the parent's memory and strides.
-  return ov::Tensor(buffer_tensor, begin, end);
+  ov::Tensor view(buffer_tensor, begin, end);
+
+  // Bounds guard for the strided view. The ROI inherits the PARENT's byte
+  // strides, so the last element the driver may touch sits at
+  //   sum_i (port_shape[i] - 1) * parent_byte_stride[i]
+  // (the +1 element itself spans elem_size more bytes). If the parent buffer
+  // was under-allocated relative to its declared shape, that tail lands outside
+  // the allocation and the NPU driver walks off the end during graph execution
+  // (observed as a SIGSEGV inside libze_intel_npu after all binds succeed,
+  // never at bind time). Compute the extent explicitly and fail loudly here
+  // rather than letting the driver fault on stripped frames. Since every ROI
+  // starts at offset 0 and only trims dims, a full-size parent always covers
+  // the view; a triggered check means the parent allocation is short.
+  const ov::Strides& parent_strides = buffer_tensor.get_strides();  // bytes
+  const size_t elem_size = buffer_tensor.get_element_type().size();
+  size_t max_byte_offset = 0;
+  for (size_t i = 0; i < port_shape.size(); ++i) {
+    if (port_shape[i] == 0) continue;
+    max_byte_offset += (port_shape[i] - 1) * parent_strides[i];
+  }
+  const size_t roi_end_byte = max_byte_offset + elem_size;
+  const size_t parent_capacity = buffer_tensor.get_byte_size();
+  LITERT_LOG(LITERT_INFO,
+             "Strided KV sub-view bind: parent data=%p parent_capacity=%zu "
+             "roi_end_byte=%zu elem_size=%zu",
+             buffer_tensor.data(), parent_capacity, roi_end_byte, elem_size);
+  if (roi_end_byte > parent_capacity) {
+    return litert::Error(
+        kLiteRtStatusErrorRuntimeFailure,
+        "Strided KV sub-view extends past the parent allocation; the parent "
+        "buffer was allocated smaller than its declared (max-length) shape");
+  }
+  return view;
 }
 
 }  // namespace

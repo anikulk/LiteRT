@@ -378,6 +378,14 @@ TEST(FuseSplitAttentionToSDPATest, PreserveQHeadsKeepsHeadDim) {
   EXPECT_EQ(CountOps<ov::op::v13::ScaledDotProductAttention>(model), 1u);
   EXPECT_EQ(CountOps<ov::op::v8::Softmax>(model), 0u);
   EXPECT_EQ(CountOps<ov::op::v0::MatMul>(model), 0u);
+
+  // The fold-bypass is the point of this pass: SDPA's query wires straight to
+  // the pre-fold tensor, leaving the fold Reshape with no consumer reachable
+  // from the graph outputs. It must therefore be gone (there is no explicit DCE
+  // pass in NpuOptimizer::Run, so this verifies the bypass produced a graph
+  // whose result-reachable op set has zero Reshapes -- transpose -> SDPA with
+  // no head fold/unfold round-trip, matching the layer_005_correct reference).
+  EXPECT_EQ(CountOps<ov::op::v1::Reshape>(model), 0u);
 }
 
 // Numerical check: the head-preserved SDPA must reproduce the folded reference

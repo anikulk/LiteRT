@@ -207,13 +207,42 @@ bool TryPreserveQueryHeads(ov::Output<ov::Node>& q, ov::Output<ov::Node>& mask,
   // result numerically identical to the folded computation (verified in
   // npu_optimizer_test). The head-preserved SDPA output is [1,H,S,D]; the
   // model's downstream Reshape (fixed [1,H,S,D] target) absorbs it as a no-op.
-  auto unfold_shape = ov::op::v0::Constant::create(
-      ov::element::i64, ov::Shape{4}, {int64_t{1}, heads, seq, head_dim});
-  auto q_unfold = std::make_shared<ov::op::v1::Reshape>(
-      q, unfold_shape, /*special_zero=*/false);
-  q_unfold->set_friendly_name(q.get_node_shared_ptr()->get_friendly_name() +
-                              "/preserve_q_heads_unfold");
-  q = q_unfold->output(0);
+  // The folded query is q = Reshape(prefold, [1,1,H*S,D]), where prefold is the
+  // pre-fold query. For this MQA pattern the fold merges the adjacent head and
+  // seq axes row-major, so prefold is already the head-preserved [1,H,S,D]
+  // tensor SDPA wants -- identical to what an unfold would reconstruct. Rather
+  // than fold then immediately unfold (two Reshapes that round-trip to the same
+  // tensor), bypass the fold and wire SDPA's Q straight to prefold. The fold's
+  // only remaining consumer was this Q (its bmm_4d consumers were replaced by
+  // the fused SDPA), so once rewired the fold is dead and DCE removes it. Net:
+  // transpose -> SDPA with zero reshapes, matching the head-preserved reference.
+  //
+  // prefold may be dynamically shaped at this point (this pass runs before
+  // ConstantFolding); that is fine -- v13::SDPA accepts dynamic Q and shape
+  // inference resolves it to [1,H,S,D] afterward. We only require prefold to be
+  // a rank-4 producer; if its shape is fully static it must equal [1,H,S,D].
+  // Any other producer falls back to the explicit static unfold below.
+  const auto fold_reshape = q.get_node_shared_ptr();  // confirmed v1::Reshape
+  const ov::Output<ov::Node> prefold = fold_reshape->input_value(0);
+  const auto pf_ps = prefold.get_partial_shape();
+  bool can_bypass_fold =
+      pf_ps.rank().is_static() && pf_ps.rank().get_length() == 4;
+  if (can_bypass_fold && pf_ps.is_static()) {
+    can_bypass_fold =
+        pf_ps[0].get_length() == 1 && pf_ps[1].get_length() == heads &&
+        pf_ps[2].get_length() == seq && pf_ps[3].get_length() == head_dim;
+  }
+  if (can_bypass_fold) {
+    q = prefold;
+  } else {
+    auto unfold_shape = ov::op::v0::Constant::create(
+        ov::element::i64, ov::Shape{4}, {int64_t{1}, heads, seq, head_dim});
+    auto q_unfold = std::make_shared<ov::op::v1::Reshape>(
+        q, unfold_shape, /*special_zero=*/false);
+    q_unfold->set_friendly_name(q.get_node_shared_ptr()->get_friendly_name() +
+                                "/preserve_q_heads_unfold");
+    q = q_unfold->output(0);
+  }
   mask = base;
   LITERT_LOG(LITERT_DEBUG,
              "FuseSplitAttentionToSDPA[%s]: preserving query heads "
