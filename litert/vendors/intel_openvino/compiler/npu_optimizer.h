@@ -156,6 +156,14 @@ class NpuOptimizer {
     return *this;
   }
 
+  // Folds Slice index subgraphs to Constants so Slice infers static shapes;
+  // otherwise the model stays dynamic and the NPU rejects NPU_ENABLE_STRIDES_FOR.
+  // Enabled by default: strided-ROI KV sharing cannot compile without it.
+  NpuOptimizer& SetFoldSliceIndices(bool enable) {
+    fold_slice_indices_ = enable;
+    return *this;
+  }
+
   // Runs all currently-enabled passes on |model|.
   void Run(const std::shared_ptr<ov::Model>& model) const;
 
@@ -166,6 +174,7 @@ class NpuOptimizer {
   bool fuse_split_attention_to_sdpa_ = false;
   bool sdpa_pad_kv_to_alignment_ = true;
   bool enable_moe_gather_ = false;
+  bool fold_slice_indices_ = true;
 };
 
 }  // namespace openvino

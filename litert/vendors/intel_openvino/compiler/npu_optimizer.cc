@@ -1154,7 +1154,15 @@ void NpuOptimizer::Run(const std::shared_ptr<ov::Model>& model) const {
   if (enable_moe_gather_) {
     pass_manager.register_pass<MoEGatherRewrite>();
   }
+  if (fold_slice_indices_) {
+    // Fold Slice's index subgraphs to Constants so it infers a static shape.
+    pass_manager.register_pass<ov::pass::ConstantFolding>();
+  }
   pass_manager.run_passes(model);
+  if (fold_slice_indices_) {
+    // Re-validate so the now-static Slice shapes propagate to downstream ops.
+    model->validate_nodes_and_infer_types();
+  }
 }
 
 }  // namespace openvino
