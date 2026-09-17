@@ -216,14 +216,16 @@ std::shared_ptr<ov::Node> BuildContiguousKvSdpa(
   if (k_is_transposed) add_transpose(key_out);
   if (v_is_transposed) add_transpose(val_out);
 
-  // The maskless ctor applies OV's default 1/sqrt(headDim) while the Concat form passes
-  // an explicit 1.0, so fold sqrt(headDim) into Q to cancel it.
-  auto sqrt_head_dim = ov::op::v0::Constant::create(
-      q4d.get_element_type(), ov::Shape{}, {std::sqrt(static_cast<double>(head_dim))});
-  ov::Output<ov::Node> q_in = std::make_shared<ov::op::v1::Multiply>(q4d, sqrt_head_dim);
-
+  // v13 SDPA has no (q,k,v,scale,causal) overload: the maskless form always applies OV's
+  // default 1/sqrt(headDim). Pass a scalar zero mask -- additive identity, so it changes
+  // nothing -- purely to reach the scale argument and keep the explicit 1.0 the Concat
+  // form uses. The compiler drops this mask again once it derives seqLenK.
+  auto zero_mask = ov::op::v0::Constant::create(q4d.get_element_type(),
+                                                ov::Shape{1, 1, 1, 1}, {0.0f});
+  auto scale_const = ov::op::v0::Constant::create(q4d.get_element_type(), ov::Shape{},
+                                                  std::vector<float>{1.0f});
   auto sdpa = std::make_shared<ov::op::v13::ScaledDotProductAttention>(
-      q_in, key_out, val_out, /*causal=*/false);
+      q4d, key_out, val_out, zero_mask, scale_const, /*causal=*/false);
 
   // Refold to the shape the original consumers expect.
   const auto out_shape = add_node->get_output_shape(0);
@@ -237,7 +239,7 @@ std::shared_ptr<ov::Node> BuildContiguousKvSdpa(
                              t_val, t_flat, kv_idx,
                              key_out.get_node_shared_ptr(),
                              val_out.get_node_shared_ptr(),
-                             q_in.get_node_shared_ptr(), sdpa, folded};
+                             zero_mask, scale_const, sdpa, folded};
   new_nodes.insert(new_nodes.end(), added.begin(), added.end());
   return folded;
 }
