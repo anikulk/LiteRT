@@ -216,7 +216,8 @@ std::shared_ptr<ov::Node> BuildContiguousKvSdpa(
   if (k_is_transposed) add_transpose(key_out);
   if (v_is_transposed) add_transpose(val_out);
 
-  // Fold the scale into Q so the maskless ctor default of 1/sqrt(headDim) cancels.
+  // The maskless ctor applies OV's default 1/sqrt(headDim) while the Concat form passes
+  // an explicit 1.0, so fold sqrt(headDim) into Q to cancel it.
   auto sqrt_head_dim = ov::op::v0::Constant::create(
       q4d.get_element_type(), ov::Shape{}, {std::sqrt(static_cast<double>(head_dim))});
   ov::Output<ov::Node> q_in = std::make_shared<ov::op::v1::Multiply>(q4d, sqrt_head_dim);
