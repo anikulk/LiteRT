@@ -77,6 +77,9 @@ class OpenVinoCompileContext {
   // whether the `FuseSplitAttentionToSDPA` pass pads KV sequences up to the NPU
   // SDPA kernel's required alignment when fusing.
   bool sdpa_pad_kv_to_alignment_ = true;
+  // KV-scatter + query-unfold rewrite so the NPU flash kernel can bound the KV
+  // range (see ScatterKvForFlashRange). Off by default.
+  bool scatter_kv_for_flash_range_ = false;
 };
 
 }  // namespace openvino

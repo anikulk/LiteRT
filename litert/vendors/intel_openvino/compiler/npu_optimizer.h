@@ -81,7 +81,9 @@ class FuseSplitAttentionToSDPA : public ov::pass::MatcherPass {
   // false, such blocks are left unfused. When true(default), the merged K/V
   // is padded up to the next multiple of 16 and the mask is padded with a
   // large negative bias so the padded key positions are excluded from softmax.
-  explicit FuseSplitAttentionToSDPA(bool pad_kv_to_alignment);
+  explicit FuseSplitAttentionToSDPA(bool pad_kv_to_alignment,
+                                    bool scatter_kv_for_flash_range = false,
+                                    int64_t scatter_min_ssl = 0);
 };
 
 // Rewrites Gemma4's dense Mixture-of-Experts block — where all N experts are
@@ -148,6 +150,14 @@ class NpuOptimizer {
     return *this;
   }
 
+  // Emits the contiguous-KV (ScatterUpdate) form so the NPU AttentionDMAFlash
+  // kernel can bound the KV range. Disabled by default; enable via config key
+  // "scatter_kv_for_flash_range" = "true". Only applies at/above sSL >= 8192.
+  NpuOptimizer& SetScatterKvForFlashRange(bool enable) {
+    scatter_kv_for_flash_range_ = enable;
+    return *this;
+  }
+
   // Toggles the MoEGatherRewrite pass. Disabled by default; enable via config
   // key "enable_moe_gather" = "true" to turn Gemma4's dense masked MoE into
   // gather-based selective (K-of-N) expert computation.
@@ -165,6 +175,7 @@ class NpuOptimizer {
   bool cast_integer_sign_to_float_ = true;
   bool fuse_split_attention_to_sdpa_ = false;
   bool sdpa_pad_kv_to_alignment_ = true;
+  bool scatter_kv_for_flash_range_ = false;
   bool enable_moe_gather_ = false;
 };
 

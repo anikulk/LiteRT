@@ -89,6 +89,18 @@ OpenVinoCompileContext::OpenVinoCompileContext() {
         context.eliminate_fq_after_matmul_ = (value == "true");
         continue;
       }
+      if (key == "scatter_kv_for_flash_range") {
+        LITERT_LOG(LITERT_INFO, "Custom config: scatter_kv_for_flash_range = %s",
+                   value.c_str());
+        context.scatter_kv_for_flash_range_ = (value == "true");
+        if (context.scatter_kv_for_flash_range_ && context.device_ != "NPU") {
+          LITERT_LOG(LITERT_WARNING,
+                     "scatter_kv_for_flash_range requested for device %s: it targets the "
+                     "NPU AttentionDMAFlash kernel and will be ignored",
+                     context.device_.c_str());
+        }
+        continue;
+      }
       if (key == "fuse_split_attention_to_sdpa") {
         LITERT_LOG(LITERT_INFO,
                    "Custom config: fuse_split_attention_to_sdpa = %s",
@@ -190,6 +202,9 @@ void OpenVinoCompileContext::OptimizeModel(
         .SetEliminateMatMulFakeQuantize(eliminate_fq_after_matmul_)
         .SetFuseSplitAttentionToSDPA(fuse_split_attention_to_sdpa_)
         .SetSdpaPadKvToAlignment(sdpa_pad_kv_to_alignment_)
+        // Explicit NPU check: this targets the NPU flash kernel and would be
+        // wrong to carry onto another device if this block is restructured.
+        .SetScatterKvForFlashRange(scatter_kv_for_flash_range_ && device_ == "NPU")
         .SetEnableMoeGather(enable_moe_gather_)
         .Run(model);
   }

@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -30,6 +31,9 @@
 
 #include "openvino/core/graph_util.hpp"
 #include "openvino/core/model.hpp"
+#include "openvino/op/greater.hpp"
+#include "openvino/op/scatter_update.hpp"
+#include "openvino/op/subtract.hpp"
 #include "openvino/core/node.hpp"
 #include "openvino/core/node_output.hpp"
 #include "openvino/core/rt_info.hpp"
@@ -109,6 +113,151 @@ ov::Output<ov::Node> PadEndOfAxis(const ov::Output<ov::Node>& input,
       ->output(0);
 }
 
+// Builds the contiguous-KV form of a fused attention layer for the NPU
+// AttentionDMAFlash kernel. Four coupled changes vs. the Concat form:
+//   K,V   ScatterUpdate(cache, T+iota, new) instead of Concat, so the valid KV
+//         span is contiguous from 0 (Concat leaves a hole up to buffer capacity
+//         that the kernel's causal geometry can't express).
+//   Q     Bypass the head-fold Reshape so the kernel sees the true query length
+//         instead of heads * query length.
+//   mask  Dropped; a bound seqLen produces the same causal triangle the mask
+//         encoded (verified equivalent for T = 0..1920).
+//   scale Folded into Q as q * sqrt(headDim), to cancel the maskless ctor's
+//         default 1/sqrt(headDim) scale.
+// T is derived in-graph from the mask (valid count in row 0, minus 1); the NPU
+// compiler then derives seqLen from the scatter indices structurally.
+// Returns null (caller falls back to Concat) when the layer doesn't match the
+// expected shape.
+std::shared_ptr<ov::Node> BuildContiguousKvSdpa(
+    const ov::Output<ov::Node>& q, const ov::Output<ov::Node>& k_cache,
+    const ov::Output<ov::Node>& k_new, const ov::Output<ov::Node>& v_cache,
+    const ov::Output<ov::Node>& v_new, const ov::Output<ov::Node>& mask_value,
+    int64_t k_concat_axis, int64_t v_concat_axis, bool k_is_transposed,
+    bool v_is_transposed, const std::shared_ptr<ov::Node>& add_node,
+    ov::NodeVector& new_nodes) {
+  // Q must come from the head-fold Reshape so it can be bypassed.
+  auto q_reshape =
+      std::dynamic_pointer_cast<ov::op::v1::Reshape>(q.get_node_shared_ptr());
+  if (q_reshape == nullptr) {
+    return nullptr;
+  }
+  const auto q4d = q_reshape->input_value(0);
+  const auto q4d_ps = q4d.get_partial_shape();
+  if (q4d_ps.rank().is_dynamic() || q4d_ps.size() != 4 || q4d_ps[1].is_dynamic() ||
+      q4d_ps[2].is_dynamic() || q4d_ps[3].is_dynamic()) {
+    return nullptr;
+  }
+  const int64_t heads = q4d_ps[1].get_length();
+  const int64_t chunk = q4d_ps[2].get_length();
+  const int64_t head_dim = q4d_ps[3].get_length();
+  const auto q_ps = q.get_partial_shape();
+  if (q_ps.rank().is_dynamic() || q_ps.size() != 4 || q_ps[2].is_dynamic() ||
+      heads * chunk != q_ps[2].get_length() || chunk <= 1) {
+    return nullptr;  // not the fold we expect
+  }
+
+  // T = (valid count in mask row 0) - 1. Greater() avoids depending on the
+  // exact sentinel value.
+  const auto mask_ps = mask_value.get_partial_shape();
+  if (mask_ps.rank().is_dynamic() || mask_ps.size() != 4 || mask_ps[3].is_dynamic()) {
+    return nullptr;
+  }
+  const int64_t mask_w = mask_ps[3].get_length();
+  auto row_start = ov::op::v0::Constant::create(ov::element::i64, {4}, {0, 0, 0, 0});
+  auto row_stop = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4},
+                                               std::vector<int64_t>{1, 1, 1, mask_w});
+  auto row_step = ov::op::v0::Constant::create(ov::element::i64, {4}, {1, 1, 1, 1});
+  auto row =
+      std::make_shared<ov::op::v8::Slice>(mask_value, row_start, row_stop, row_step);
+  auto thresh = ov::op::v0::Constant::create(mask_value.get_element_type(), ov::Shape{},
+                                             {kSdpaPadMaskBias / 2.0f});
+  auto valid = std::make_shared<ov::op::v1::Greater>(row, thresh);
+  auto valid_i32 = std::make_shared<ov::op::v0::Convert>(valid, ov::element::i32);
+  auto red_axes = ov::op::v0::Constant::create(ov::element::i64, {4}, {0, 1, 2, 3});
+  auto count = std::make_shared<ov::op::v1::ReduceSum>(valid_i32, red_axes, true);
+  auto one = ov::op::v0::Constant::create(ov::element::i32, {1, 1, 1, 1}, {1});
+  auto t_val = std::make_shared<ov::op::v1::Subtract>(count, one);
+  t_val->set_friendly_name("kv_scatter_base_T");  // for reading dumped IR only
+
+  // Index width comes from the new KV block, not Q -- they can differ once
+  // the new block is padded for alignment.
+  const auto new_ps = k_new.get_partial_shape();
+  if (new_ps.rank().is_dynamic() || new_ps[k_concat_axis].is_dynamic()) {
+    return nullptr;
+  }
+  const int64_t new_len = new_ps[k_concat_axis].get_length();
+  std::vector<int32_t> iota(static_cast<size_t>(new_len));
+  for (int64_t i = 0; i < new_len; ++i) {
+    iota[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  }
+  auto iota_c = ov::op::v0::Constant::create(
+      ov::element::i32, ov::Shape{static_cast<size_t>(new_len)}, iota);
+  auto t_flat_shape = ov::op::v0::Constant::create(ov::element::i64, {1}, {1});
+  auto t_flat = std::make_shared<ov::op::v1::Reshape>(t_val, t_flat_shape, false);
+  auto kv_idx = std::make_shared<ov::op::v1::Add>(t_flat, iota_c);
+
+  const auto scatter = [&](const ov::Output<ov::Node>& cache,
+                           const ov::Output<ov::Node>& fresh,
+                           int64_t axis) -> ov::Output<ov::Node> {
+    auto axis_c = ov::op::v0::Constant::create(ov::element::i32, ov::Shape{},
+                                               {static_cast<int32_t>(axis)});
+    return std::make_shared<ov::op::v3::ScatterUpdate>(cache, kv_idx, fresh, axis_c);
+  };
+  ov::Output<ov::Node> key_out = scatter(k_cache, k_new, k_concat_axis);
+  ov::Output<ov::Node> val_out = scatter(v_cache, v_new, v_concat_axis);
+
+  const auto add_transpose = [&](ov::Output<ov::Node>& target) {
+    auto perm =
+        ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4}, {0, 1, 3, 2});
+    target = std::make_shared<ov::op::v1::Transpose>(target, perm);
+    new_nodes.push_back(perm);
+    new_nodes.push_back(target.get_node_shared_ptr());
+  };
+  if (k_is_transposed) add_transpose(key_out);
+  if (v_is_transposed) add_transpose(val_out);
+
+  // Fold the scale into Q so the maskless ctor default of 1/sqrt(headDim) cancels.
+  auto sqrt_head_dim = ov::op::v0::Constant::create(
+      q4d.get_element_type(), ov::Shape{}, {std::sqrt(static_cast<double>(head_dim))});
+  ov::Output<ov::Node> q_in = std::make_shared<ov::op::v1::Multiply>(q4d, sqrt_head_dim);
+
+  auto sdpa = std::make_shared<ov::op::v13::ScaledDotProductAttention>(
+      q_in, key_out, val_out, /*causal=*/false);
+
+  // Refold to the shape the original consumers expect.
+  const auto out_shape = add_node->get_output_shape(0);
+  std::vector<int64_t> back(out_shape.begin(), out_shape.end());
+  auto back_c =
+      ov::op::v0::Constant::create(ov::element::i64, ov::Shape{back.size()}, back);
+  auto folded = std::make_shared<ov::op::v1::Reshape>(sdpa, back_c, false);
+  folded->set_friendly_name(add_node->get_friendly_name());
+
+  const ov::NodeVector added{row,   valid, valid_i32, count,
+                             t_val, t_flat, kv_idx,
+                             key_out.get_node_shared_ptr(),
+                             val_out.get_node_shared_ptr(),
+                             q_in.get_node_shared_ptr(), sdpa, folded};
+  new_nodes.insert(new_nodes.end(), added.begin(), added.end());
+  return folded;
+}
+
+// True when this partition is the speculative-decode verify signature, where
+// the contiguous-KV form's mask-based T derivation doesn't hold (verify uses a
+// different mask, e.g. tree/hybrid rather than plain causal prefix). Gated on
+// the signature name rather than query length, since the current length gap
+// is incidental. Partitions are identified by their tensor name prefix
+// ("prefill_128_kv_cache_k_0", "verify_...").
+bool IsVerifySignature(const std::shared_ptr<ov::Model>& model) {
+  for (const auto& input : model->inputs()) {
+    for (const auto& name : input.get_names()) {
+      if (name.rfind("verify", 0) == 0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 }  // namespace
 
 EliminateMatMulFakeQuantize::EliminateMatMulFakeQuantize() {
@@ -171,7 +320,9 @@ CastIntegerSignToFloat::CastIntegerSignToFloat() {
   register_matcher(m, callback);
 }
 
-FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
+FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment,
+                                                   bool scatter_kv_for_flash_range,
+                                                   int64_t scatter_min_ssl) {
   namespace pattern = ov::pass::pattern;
 
   auto q_input = pattern::any_input();
@@ -391,6 +542,29 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
                  static_cast<long long>(kv_len),
                  static_cast<long long>(kv_pad));
       return false;
+    }
+
+    // Contiguous-KV variant for the NPU flash kernel, built here (instead of a
+    // later pass) since k_cache/k_new/layout/alignment are already in hand.
+    // Falls back to Concat below if the layer doesn't match the expected shape.
+    if (scatter_kv_for_flash_range && kv_len_static && kv_len >= scatter_min_ssl) {
+      ov::NodeVector scatter_nodes;
+      if (auto scattered = BuildContiguousKvSdpa(
+              q, k_cache, k_new, v_cache, v_new, mask_value, k_concat_axis,
+              v_concat_axis, k_is_transposed, v_is_transposed, add_node,
+              scatter_nodes)) {
+        ov::copy_runtime_info(m.get_matched_nodes(), scatter_nodes);
+        ov::replace_node(add_node, scattered);
+        LITERT_LOG(LITERT_INFO,
+                   "FuseSplitAttentionToSDPA[%s]: contiguous-KV (ScatterUpdate) form, "
+                   "kv_len=%lld",
+                   root_name.c_str(), static_cast<long long>(kv_len));
+        return true;
+      }
+      LITERT_LOG(LITERT_DEBUG,
+                 "FuseSplitAttentionToSDPA[%s]: contiguous-KV not applicable, using "
+                 "Concat",
+                 root_name.c_str());
     }
 
     auto k_concat = std::make_shared<ov::op::v0::Concat>(
@@ -1145,8 +1319,18 @@ void NpuOptimizer::Run(const std::shared_ptr<ov::Model>& model) const {
     pass_manager.register_pass<CastIntegerSignToFloat>();
   }
   if (fuse_split_attention_to_sdpa_) {
+    // Contiguous-KV targets the NPU flash kernel specifically; don't let that
+    // stay an implicit dependency on NpuOptimizer only running for NPU today.
+    bool scatter_kv = scatter_kv_for_flash_range_;
+    if (scatter_kv && IsVerifySignature(model)) {
+      LITERT_LOG(LITERT_INFO,
+                 "contiguous-KV: disabled for the verify signature (its mask is built "
+                 "differently, so the in-graph T derivation would not hold)");
+      scatter_kv = false;
+    }
     pass_manager.register_pass<FuseSplitAttentionToSDPA>(
-        sdpa_pad_kv_to_alignment_);
+        sdpa_pad_kv_to_alignment_, scatter_kv,
+        /*scatter_min_ssl=*/8192);
   }
   if (eliminate_matmul_fq_) {
     pass_manager.register_pass<EliminateMatMulFakeQuantize>();
