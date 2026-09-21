@@ -637,6 +637,67 @@ LiteRtStatus LiteRtCompilerPluginCompile(
           }
         }
 
+        // Enable strided (non-contiguous) input layouts on the global-layer KV
+        // ports so the runtime can bind a shorter signature as a zero-copy
+        // sub-view; without it the NPU relayouts the strided V view to contiguous
+        // every invoke (a hidden ~2x copy). A KV Parameter is "global" iff its
+        // seq extent equals the partition's largest (local/windowed layers stay
+        // contiguous). NPU_ENABLE_STRIDES_FOR takes comma-separated tensor names;
+        // requires fold_slice_indices (default on) so the model is not dynamic.
+        {
+          const std::string& device = context.Device();
+          const bool is_npu = device.find("NPU") != std::string::npos;
+          if (is_npu) {
+            auto kv_seq_extent =
+                [](const std::shared_ptr<ov::op::v0::Parameter>& p) -> int64_t {
+              const auto& ps = p->get_partial_shape();
+              if (ps.rank().is_dynamic()) return 0;
+              int64_t seq = 0;
+              for (const auto& d : ps) {
+                if (d.is_static()) seq = std::max<int64_t>(seq, d.get_length());
+              }
+              return seq;
+            };
+            auto param_name =
+                [](const std::shared_ptr<ov::op::v0::Parameter>& p) -> std::string {
+              const auto& names = p->get_output_tensor(0).get_names();
+              if (!names.empty()) return *names.begin();
+              return p->get_friendly_name();
+            };
+            // Pass 1: find the largest KV seq extent (the global-layer context).
+            int64_t max_kv_seq = 0;
+            for (const auto& p : ov_model->get_parameters()) {
+              if (param_name(p).find("kv_cache") == std::string::npos) continue;
+              max_kv_seq = std::max(max_kv_seq, kv_seq_extent(p));
+            }
+            // Pass 2: collect the global-layer KV ports (seq == max_kv_seq).
+            std::string stride_names;
+            int stride_count = 0;
+            if (max_kv_seq > 0) {
+              for (const auto& p : ov_model->get_parameters()) {
+                const std::string nm = param_name(p);
+                if (nm.find("kv_cache") == std::string::npos) continue;
+                if (kv_seq_extent(p) != max_kv_seq) continue;
+                if (!stride_names.empty()) stride_names += ",";
+                stride_names += nm;
+                ++stride_count;
+              }
+            }
+            if (stride_count > 0) {
+              configs["NPU_ENABLE_STRIDES_FOR"] = stride_names;
+              LITERT_LOG(LITERT_INFO,
+                         "NPU strides enabled for %d global KV port(s) "
+                         "(seq=%lld) in partition %d: %s",
+                         stride_count, static_cast<long long>(max_kv_seq),
+                         partition_idx, stride_names.c_str());
+            } else {
+              LITERT_LOG(LITERT_INFO,
+                         "NPU strides: no global KV ports found in partition %d",
+                         partition_idx);
+            }
+          }
+        }
+
         // Compile using the per-partition device and properties.
         LITERT_LOG(LITERT_INFO, "Compiling partition %d for device %s",
                    partition_idx, context.Device().c_str());
